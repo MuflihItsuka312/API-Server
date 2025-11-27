@@ -24,13 +24,15 @@ mongoose
   .then(() => console.log("✅ Connected to MongoDB"))
   .catch((err) => console.error("❌ MongoDB connection error:", err));
 
-// === SCHEMA & MODEL ===
 const { Schema, model } = mongoose;
+
+// ==================================================
+// MODELS
+// ==================================================
 
 /**
  * USER (customer / agent)
- * - sekarang ada email, phone, role
- * - disimpan di koleksi "customer_users" (biar cocok dengan yang sudah ada)
+ * - koleksi: customer_users
  */
 const userSchema = new Schema(
   {
@@ -60,14 +62,16 @@ const shipmentSchema = new Schema(
     customerId: { type: String },
     itemType: { type: String },
 
-    courierPlate: { type: String },          // ⬅️ sudah ada
-    // ⬇️ tambah ini
-    courierName: { type: String },           // nama kurir (diisi dari login)
+    courierId: { type: String },
+    courierPlate: { type: String },
+    courierName: { type: String },
+
+    // 🔹 token rahasia per shipment/resi (dipakai kurir + server + ESP32)
+    token: { type: String, unique: true, sparse: true },
 
     status: { type: String, default: "assigned_to_locker" },
     createdAt: { type: Date, default: Date.now },
 
-    // ⬇️ biar shipment.logs.push(...) nggak error & ke-save
     logs: {
       type: [
         {
@@ -82,49 +86,58 @@ const shipmentSchema = new Schema(
     },
 
     deliveredToLockerAt: { type: Date },
+    deliveredToCustomerAt: { type: Date },
     pickedUpAt: { type: Date },
   },
   { versionKey: false }
 );
-
 const Shipment = model("Shipment", shipmentSchema, "shipments");
 
 /**
  * Locker (per kotak fisik)
  */
-// Model Locker (pastikan collection: 'lockers')
-
 const lockerSchema = new Schema(
   {
     lockerId: { type: String, required: true, unique: true },
     lockerToken: { type: String, default: null },
+    
+    // Lama: list resi (tetap dipertahankan untuk kompatibilitas)
     pendingResi: { type: [String], default: [] },
+
+    // 🔹 Baru: pool resi + token per resi (dipakai skenario multi-kurir)
+    pendingShipments: {
+      type: [
+        {
+          resi: String,
+          customerId: String,
+          token: String,
+          status: {
+            type: String,
+            enum: ["pending", "used"],
+            default: "pending",
+          },
+        },
+      ],
+      default: [],
+    },
+    
     command: { type: Schema.Types.Mixed, default: null },
+
+    // ON/OFF manual oleh agent
     isActive: { type: Boolean, default: true },
+
+    // status heartbeat: "online" / "offline" / "unknown"
     status: { type: String, default: "unknown" },
+
     tokenUpdatedAt: { type: Date },
     lastHeartbeat: { type: Date },
   },
-  {
-    collection: "lockers", // PENTING: sama persis dengan di Compass
-  }
+  { collection: "lockers" }
 );
-
 const Locker = model("Locker", lockerSchema);
 
-// Endpoint: GET /api/lockers
-app.get("/api/lockers", async (req, res) => {
-  try {
-    const lockers = await Locker.find({}).lean();
-    res.json({ data: lockers });
-  } catch (err) {
-    console.error("GET /api/lockers error:", err);
-    res.status(500).json({ error: "Failed to fetch lockers" });
-  }
-});
-
 /**
- * LockerLog (optional, untuk audit)
+ * LockerLog (optional, audit trail)
  */
 const lockerLogSchema = new Schema(
   {
@@ -137,47 +150,71 @@ const lockerLogSchema = new Schema(
 );
 const LockerLog = model("LockerLog", lockerLogSchema, "locker_logs");
 
+/**
+ * Customer manual tracking (user input resi di app)
+ */
+const customerTrackingSchema = new Schema(
+  {
+    resi: { type: String, required: true },
+    courierType: { type: String, required: true },
+    customerId: { type: String },
+    note: { type: String },
+  },
+  { timestamps: true, versionKey: false }
+);
+const CustomerTracking = model(
+  "CustomerTracking",
+  customerTrackingSchema,
+  "customer_trackings"
+);
 
-//locker-
-// ====== In-Memory Lockers (atau nanti bisa pakai Mongo) ======
-const lockers = {};  // key: lockerId -> value: locker object
-
-function getLocker(lockerId) {
-  if (!lockers[lockerId]) {
-    lockers[lockerId] = {
-      lockerId,
-      lockerToken: `LK-${lockerId}-${Math.random().toString(36).slice(2, 8)}`,
-      pendingResi: [],
-      command: null,
-      active: true,
-      lastHeartbeat: null,
-    };
+/**
+ * Courier (kurir)
+ */
+const courierSchema = new Schema(
+  {
+    courierId: { type: String, unique: true }, // CR-ANT-xxx
+    name: { type: String, required: true },
+    company: { type: String, required: true }, // anteraja, jne, jnt, dll
+    plate: { type: String, required: true }, // uppercased
+    state: {
+      type: String,
+      enum: ["active", "ongoing", "inactive"],
+      default: "active",
+    },
+  },
+  {
+    collection: "couriers",
+    timestamps: true,
   }
-  return lockers[lockerId];
+);
+const Courier = model("Courier", courierSchema);
+
+// ==================================================
+// HELPERS
+// ==================================================
+
+// Helper: generate random token
+function randomToken(prefix) {
+  return `${prefix}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-// GET semua locker (Locker Client Pool)
-app.get("/api/lockers", (req, res) => {
-  const list = Object.values(lockers).map((l) => ({
-    lockerId: l.lockerId,
-    lockerToken: l.lockerToken,
-    pendingCount: Array.isArray(l.pendingResi) ? l.pendingResi.length : 0,
-    active: l.active !== false,
-    lastHeartbeat: l.lastHeartbeat || null,
-  }));
-  res.json({ data: list });
-});
+// Helper: generate 6-digit customerId (userId)
+function generateCustomerId() {
+  return String(Math.floor(100000 + Math.random() * 900000)); // 100000 - 999999
+}
 
-// GET detail locker
-app.get("/api/lockers/:lockerId", (req, res) => {
-  const lockerId = req.params.lockerId;
-  const locker = lockers[lockerId];
-  if (!locker) return res.status(404).json({ error: "Locker not found" });
+// Helper: generate token unik per shipment
+function generateShipmentToken() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let out = "tok_";
+  for (let i = 0; i < 8; i++) {
+    out += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return out;
+}
 
-  res.json({ data: locker });
-});
-
-// Helper untuk dapat locker, auto-create kalau belum ada
+// Helper: dapat locker dari Mongo, auto-create jika belum ada
 async function getLocker(lockerId) {
   let locker = await Locker.findOne({ lockerId });
   if (!locker) {
@@ -185,13 +222,44 @@ async function getLocker(lockerId) {
       lockerId,
       lockerToken: `LK-${lockerId}-${Math.random().toString(36).slice(2, 8)}`,
       pendingResi: [],
+      pendingShipments: [],        // 🔹 pastikan field baru ikut terisi
       command: null,
+      isActive: true,
+      status: "unknown",
     });
   }
   return locker;
 }
 
-// === AUTH MIDDLEWARE ===
+// Helper: recalculate courier state based on shipments
+async function recalcCourierState(courierId) {
+  const courier = await Courier.findOne({ courierId });
+  if (!courier) return;
+
+  // cek apakah masih ada shipment aktif untuk kurir ini
+  const notDoneCount = await Shipment.countDocuments({
+    courierId,
+    status: { $ne: "delivered_to_customer" },
+  });
+
+  let newState = courier.state;
+
+  if (notDoneCount > 0) {
+    // masih ada tugas
+    newState = "ongoing";
+  } else {
+    // semua tugas selesai -> INACTIVE
+    newState = "inactive";
+  }
+
+  if (newState !== courier.state) {
+    courier.state = newState;
+    await courier.save();
+    console.log(`[COURIER] ${courierId} -> ${newState}`);
+  }
+}
+
+// Auth middleware (JWT)
 function auth(req, res, next) {
   try {
     const header = req.headers.authorization;
@@ -206,14 +274,16 @@ function auth(req, res, next) {
   }
 }
 
-// === ENDPOINTS ===
+// ==================================================
+// ROUTES
+// ==================================================
 
 // 0. Health check
 app.get("/", (req, res) => {
   res.send("Smart Locker backend with MongoDB is running ✅");
 });
 
-// === AUTH ENDPOINTS (Customer) ===
+// ---------------------- AUTH (Customer) ----------------------
 
 // Register customer
 app.post("/api/auth/register", async (req, res) => {
@@ -232,7 +302,7 @@ app.post("/api/auth/register", async (req, res) => {
     const hash = await bcrypt.hash(password, 10);
 
     const user = await User.create({
-      userId: "cus_" + Date.now(),
+      userId: generateCustomerId(), // 6 digit random
       name,
       email,
       phone,
@@ -277,76 +347,115 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
-// === AGENT ENDPOINTS ===
+// ---------------------- AGENT: Shipments ----------------------
 
-// 1) Agent input paket (bisa banyak resi sekaligus)
+// Agent input paket (bisa banyak resi sekaligus)
 app.post("/api/shipments", async (req, res) => {
   try {
     const {
       lockerId,
-      courierType, // utama
+      courierType,
       resiList,
       receiverName,
       receiverPhone,
       customerId,
       itemType,
-      courierPlate, // dari front-end
-      courierLabel, // label kurir opsional
+      courierPlate,
+      courierLabel,
       courierId,
     } = req.body;
 
     if (!lockerId || !courierType || !Array.isArray(resiList) || resiList.length === 0) {
-      return res.status(400).json({ error: "lockerId, courierType, resiList wajib diisi" });
+      return res
+        .status(400)
+        .json({ error: "lockerId, courierType, resiList wajib diisi" });
     }
 
     const locker = await getLocker(lockerId);
 
-    // Jika user memilih courierId dari pool, coba ambil nama kurir
+    // coba ambil nama kurir dari koleksi Courier jika courierId dikirim
     let courierName = courierLabel || "";
+    let courier = null;
     if (courierId) {
-      try {
-        const c = await Courier.findOne({ courierId });
-        if (c && c.name) courierName = c.name;
-      } catch (e) {
-        // ignore
+      courier = await Courier.findOne({ courierId });
+      if (!courier) {
+        return res.status(404).json({ error: "Courier not found" });
       }
+      if (courier.state !== "active") {
+        return res
+          .status(400)
+          .json({ error: `Courier ${courierId} not available (state=${courier.state})` });
+      }
+      courierName = courier.name;
     }
 
     const createdShipments = [];
 
     for (const resi of resiList) {
-      // hindari duplikasi: jika sudah ada shipment aktif untuk resi, skip pembuatan baru
-      const exists = await Shipment.findOne({ resi });
-      if (exists) {
-        // tambahkan ke pendingResi locker jika belum ada dan status belum selesai
-        if (
-          !locker.pendingResi.includes(resi) &&
-          exists.status !== "completed" &&
-          exists.status !== "delivered_to_locker"
-        ) {
-          locker.pendingResi.push(resi);
+      const normalizedResi = String(resi).trim();
+
+      // Cek shipment existing
+      let sh = await Shipment.findOne({ resi: normalizedResi });
+
+      if (sh) {
+        // Kalau shipment lama BELUM ada token, generate sekarang
+        if (!sh.token) {
+          sh.token = generateShipmentToken();
+          await sh.save();
         }
-        createdShipments.push(exists);
+
+        // Masukkan ke pendingResi (lama) kalau belum ada
+        if (
+          !locker.pendingResi.includes(normalizedResi) &&
+          sh.status !== "completed" &&
+          sh.status !== "delivered_to_locker"
+        ) {
+          locker.pendingResi.push(normalizedResi);
+        }
+
+        // Masukkan ke pendingShipments (baru) kalau belum ada
+        const alreadyInPool = locker.pendingShipments.some(
+          (p) => p.resi === normalizedResi && p.token === sh.token
+        );
+        if (!alreadyInPool) {
+          locker.pendingShipments.push({
+            resi: normalizedResi,
+            customerId: sh.customerId || customerId || "",
+            token: sh.token,
+            status: "pending",
+          });
+        }
+
+        createdShipments.push(sh);
         continue;
       }
 
-      const sh = await Shipment.create({
-        resi,
+      // Shipment BARU
+      const shipmentToken = generateShipmentToken();
+
+      sh = await Shipment.create({
+        resi: normalizedResi,
         courierType,
         lockerId,
+        courierId: courierId || "",
         receiverName: receiverName || "Customer Demo",
         receiverPhone: receiverPhone || "",
         customerId: customerId || "",
         itemType: itemType || "",
-        courierPlate: courierPlate || "",
+        courierPlate: courierPlate
+          ? courierPlate.trim().toUpperCase()
+          : courier
+          ? courier.plate
+          : "",
         courierName: courierName || "",
+        token: shipmentToken,             // 🔹 token per resi
         status: "pending_locker",
         createdAt: new Date(),
         logs: [
           {
             event: "assigned_to_locker",
             lockerId,
-            resi,
+            resi: normalizedResi,
             timestamp: new Date(),
             extra: { source: "agent" },
           },
@@ -355,20 +464,37 @@ app.post("/api/shipments", async (req, res) => {
 
       createdShipments.push(sh);
 
-      if (!locker.pendingResi.includes(resi)) {
-        locker.pendingResi.push(resi);
+      if (!locker.pendingResi.includes(normalizedResi)) {
+        locker.pendingResi.push(normalizedResi);
       }
+
+      locker.pendingShipments.push({
+        resi: normalizedResi,
+        customerId: sh.customerId || customerId || "",
+        token: shipmentToken,
+        status: "pending",
+      });
     }
 
     await locker.save();
 
-    return res.json({ message: "Shipments assigned to locker", locker, shipments: createdShipments });
+    // Set courier to ONGOING after assignment
+    if (courier) {
+      courier.state = "ongoing";
+      await courier.save();
+      console.log(`[COURIER] ${courierId} -> ongoing (assigned shipments)`);
+    }
+
+    return res.json({
+      message: "Shipments assigned to locker",
+      locker,
+      shipments: createdShipments,
+    });
   } catch (err) {
     console.error("POST /api/shipments error:", err);
     return res.status(500).json({ error: "Internal server error" });
   }
 });
-
 
 // List semua shipments (untuk Agent dashboard)
 app.get("/api/shipments", async (req, res) => {
@@ -384,6 +510,18 @@ app.get("/api/shipments", async (req, res) => {
   } catch (err) {
     console.error("GET /api/shipments error:", err);
     res.status(500).json({ error: "Gagal mengambil data shipments" });
+  }
+});
+
+// SANITASI: hapus shipment
+app.delete("/api/shipments/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    await Shipment.findByIdAndDelete(id);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /api/shipments/:id error:", err);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -436,9 +574,107 @@ app.get("/api/validate-resi", async (req, res) => {
   }
 });
 
-// === CUSTOMER ENDPOINTS ===
+// ---------------------- CUSTOMER ENDPOINTS ----------------------
 
-// List semua shipment milik customer (pakai JWT, tidak perlu input no HP)
+// Customer input resi manual (disimpan supaya agen bisa lihat)
+// Customer input resi manual (dengan auto-validasi Binderbyte)
+app.post("/api/customer/manual-resi", auth, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { resi } = req.body;
+
+    if (!resi) {
+      return res.status(400).json({ error: "Nomor resi wajib diisi" });
+    }
+
+    const normalizedResi = resi.trim();
+
+    // VALIDASI OTOMATIS KE BINDERBYTE
+    if (! BINDER_KEY) {
+      return res.status(500).json({
+        error: "API Binderbyte belum dikonfigurasi di server",
+      });
+    }
+
+    console.log(`[VALIDASI RESI] Validating ${normalizedResi}...`);
+
+    // Coba deteksi courier dari berbagai ekspedisi
+    const couriers = ["jne", "jnt", "anteraja", "sicepat", "ninja", "pos"];
+    let validCourier = null;
+    let validData = null;
+
+    for (const courier of couriers) {
+      try {
+        const bbResp = await axios.get("https://api.binderbyte.com/v1/track", {
+          params: {
+            api_key: BINDER_KEY,
+            courier: courier,
+            awb: normalizedResi,
+          },
+        });
+
+        // Cek apakah response valid
+        if (
+          bbResp.data &&
+          bbResp.data. status === 200 &&
+          bbResp. data.data &&
+          bbResp.data.data.summary
+        ) {
+          validCourier = courier;
+          validData = bbResp.data;
+          console.log(`[VALIDASI RESI] ✅ Valid di ${courier. toUpperCase()}`);
+          break;
+        }
+      } catch (err) {
+        // Lanjut coba courier berikutnya
+        continue;
+      }
+    }
+
+    // Jika tidak valid di semua courier
+    if (!validCourier) {
+      return res.status(400).json({
+        error:
+          "Nomor resi tidak valid atau tidak ditemukan di sistem ekspedisi manapun",
+      });
+    }
+
+    // Simpan ke database jika valid
+    const doc = await CustomerTracking.create({
+      resi: normalizedResi,
+      courierType: validCourier,
+      customerId: userId,
+      note: `Auto-validated via ${validCourier. toUpperCase()}`,
+    });
+
+    res.json({
+      message: `Resi berhasil disimpan!  Terdeteksi sebagai paket ${validCourier.toUpperCase()}`,
+      data: {
+        resi: doc.resi,
+        courier: validCourier,
+        customerId: userId,
+        trackingInfo: validData. data.summary,
+      },
+    });
+  } catch (err) {
+    console.error("POST /api/customer/manual-resi error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+// Agent melihat semua resi manual dari user
+app.get("/api/manual-resi", async (req, res) => {
+  try {
+    const list = await CustomerTracking.find({})
+      .sort({ createdAt: -1 })
+      .lean();
+    res.json({ data: list });
+  } catch (err) {
+    console.error("GET /api/manual-resi error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// List semua shipment milik customer (pakai JWT)
 app.get("/api/customer/shipments", auth, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -454,7 +690,7 @@ app.get("/api/customer/shipments", auth, async (req, res) => {
   }
 });
 
-// Customer minta buka locker untuk resi tertentu (pakai JWT)
+// Customer minta buka locker untuk resi tertentu
 app.post("/api/customer/open-locker", auth, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -480,7 +716,14 @@ app.post("/api/customer/open-locker", auth, async (req, res) => {
 
     const locker = await Locker.findOneAndUpdate(
       { lockerId: shipment.lockerId },
-      { command: { type: "open", resi, source: "customer", createdAt: new Date() } },
+      {
+        command: {
+          type: "open",
+          resi,
+          source: "customer",
+          createdAt: new Date(),
+        },
+      },
       { new: true }
     );
 
@@ -510,7 +753,7 @@ app.post("/api/customer/open-locker", auth, async (req, res) => {
   }
 });
 
-// Detail tracking 1 resi (Binderbyte + internal) - bisa tanpa auth
+// Detail tracking 1 resi (Binderbyte + internal)
 app.get("/api/customer/track/:resi", async (req, res) => {
   const { resi } = req.params;
   const { courier } = req.query;
@@ -543,29 +786,15 @@ app.get("/api/customer/track/:resi", async (req, res) => {
   }
 });
 
-// === KURIR LOGIN ===
-// Kurir login pakai nama + plat.
-// Hanya berhasil kalau ada minimal 1 shipment pending_locker dengan courierPlate tsb.
+// ---------------------- COURIER ENDPOINTS ----------------------
 
-// === COURIER MODEL ===
-const courierSchema = new Schema(
-  {
-    courierId: { type: String, unique: true },   // mis: "CR-ANT-01"
-    name: { type: String, required: true },      // nama kurir: "Mas Budi"
-    company: { type: String, required: true },   // "anteraja", "jne", dll
-    plate: { type: String, required: true },     // "B 1234 CD" (UPPERCASE)
-    active: { type: Boolean, default: true },
-    createdAt: { type: Date, default: Date.now },
-  },
-  { versionKey: false }
-);
-
-const Courier = model("Courier", courierSchema, "couriers");
-// GET /api/couriers
+// GET semua kurir
 app.get("/api/couriers", async (req, res) => {
   try {
-    const couriers = await Courier.find({}).sort({ company: 1, name: 1 }).lean();
-    res.json({ data: couriers });
+    const couriers = await Courier.find({})
+      .sort({ company: 1, name: 1 })
+      .lean();
+    res.json({ ok: true, data: couriers });
   } catch (err) {
     console.error("GET /api/couriers error:", err);
     res.status(500).json({ error: "Internal server error" });
@@ -599,16 +828,55 @@ app.post("/api/couriers", async (req, res) => {
       name,
       company,
       plate,
+      state: "active",
     });
 
-    res.json({ message: "Kurir berhasil ditambahkan", courier });
+    res.json({ ok: true, message: "Kurir berhasil ditambahkan", data: courier });
   } catch (err) {
     console.error("POST /api/couriers error:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// courier login: gunakan koleksi couriers
+// Update status kurir (active / ongoing / inactive)
+app.put("/api/couriers/:courierId/status", async (req, res) => {
+  try {
+    const { courierId } = req.params;
+    const { state } = req.body;
+
+    if (!state || !["active", "ongoing", "inactive"].includes(state)) {
+      return res.status(400).json({ error: "Invalid state. Must be: active, ongoing, or inactive" });
+    }
+
+    const courier = await Courier.findOneAndUpdate(
+      { courierId },
+      { state },
+      { new: true }
+    );
+
+    if (!courier) {
+      return res.status(404).json({ error: "Courier not found" });
+    }
+
+    res.json({ ok: true, message: "Status kurir diupdate", data: courier });
+  } catch (err) {
+    console.error("PUT /api/couriers/:courierId/status error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// SANITASI: hapus kurir
+app.delete("/api/couriers/:courierId", async (req, res) => {
+  try {
+    await Courier.deleteOne({ courierId: req.params.courierId });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /api/couriers/:courierId error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Kurir login
 app.post("/api/courier/login", async (req, res) => {
   try {
     const { name, plate } = req.body;
@@ -618,18 +886,29 @@ app.post("/api/courier/login", async (req, res) => {
 
     const normalizedPlate = plate.trim().toUpperCase();
 
-    const courier = await Courier.findOne({ plate: normalizedPlate, active: true });
+    const courier = await Courier.findOne({
+      plate: normalizedPlate,
+    });
     if (!courier) {
-      return res.status(401).json({ error: "Kurir tidak terdaftar. Hubungi admin." });
+      return res
+        .status(401)
+        .json({ error: "Kurir tidak terdaftar." });
+    }
+    
+    if (courier.state === "inactive") {
+      return res
+        .status(401)
+        .json({ error: "Kurir sudah tidak aktif. Hubungi admin untuk aktivasi kembali." });
     }
 
-    // Optional: cocokan nama (case-insensitive)
     if (courier.name.toLowerCase() !== name.trim().toLowerCase()) {
       return res.status(401).json({ error: "Nama kurir tidak sesuai" });
     }
 
-    // Pastikan ada shipment pending_locker untuk plat ini
-    const exist = await Shipment.findOne({ courierPlate: normalizedPlate, status: "pending_locker" });
+    const exist = await Shipment.findOne({
+      courierPlate: normalizedPlate,
+      status: "pending_locker",
+    });
     if (!exist) {
       return res.status(401).json({
         error:
@@ -645,13 +924,12 @@ app.post("/api/courier/login", async (req, res) => {
       plate: courier.plate,
     });
   } catch (err) {
-    console.error(err);
+    console.error("POST /api/courier/login error:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// === KURIR DEPOSIT (SCAN QR SAJA) ===
-// body: { lockerToken, plate }
+// Kurir deposit via scan QR token + plat
 app.post("/api/courier/deposit", async (req, res) => {
   try {
     const { lockerToken, plate } = req.body;
@@ -664,16 +942,13 @@ app.post("/api/courier/deposit", async (req, res) => {
 
     const normalizedPlate = plate.trim().toUpperCase();
 
-    // cari locker berdasarkan token
     const locker = await Locker.findOne({ lockerToken: lockerToken.trim() });
     if (!locker) {
-      return res.status(404).json({ error: "Locker dengan token ini tidak ditemukan" });
+      return res
+        .status(404)
+        .json({ error: "Locker dengan token ini tidak ditemukan" });
     }
 
-    // cari 1 shipment yang:
-    // - milik plat kurir ini
-    // - masih pending_locker
-    // - untuk locker ini
     const shipment = await Shipment.findOne({
       courierPlate: normalizedPlate,
       status: "pending_locker",
@@ -687,7 +962,6 @@ app.post("/api/courier/deposit", async (req, res) => {
       });
     }
 
-    // update status shipment → delivered_to_locker
     shipment.status = "delivered_to_locker";
     shipment.deliveredToLockerAt = new Date();
     shipment.logs.push({
@@ -698,10 +972,7 @@ app.post("/api/courier/deposit", async (req, res) => {
     });
     await shipment.save();
 
-    // remove resi dari pendingResi locker
     locker.pendingResi = locker.pendingResi.filter((r) => r !== shipment.resi);
-
-    // set command open untuk ESP32
     locker.command = {
       type: "open",
       resi: shipment.resi,
@@ -709,6 +980,11 @@ app.post("/api/courier/deposit", async (req, res) => {
       createdAt: new Date(),
     };
     await locker.save();
+
+    // Recalc courier state after delivery (stays ongoing until all delivered to customer)
+    if (shipment.courierId) {
+      await recalcCourierState(shipment.courierId);
+    }
 
     return res.json({
       message: "Locker akan dibuka untuk paket ini",
@@ -722,25 +998,333 @@ app.post("/api/courier/deposit", async (req, res) => {
   }
 });
 
-
-// === ESP32 & KURIR ENDPOINTS ===
-
-// Ambil token locker (QR) untuk ESP32
-app.get("/api/locker/:lockerId/token", async (req, res) => {
+// 🔹 Kurir: ambil daftar shipment + token (versi baru)
+app.get("/api/courier/tasks-token", async (req, res) => {
   try {
-    const { lockerId } = req.params;
-    const locker = await getLocker(lockerId);
+    const { plate, courierId } = req.query;
+
+    const filter = {
+      status: "pending_locker", // shipment yang belum masuk locker
+    };
+
+    if (plate) {
+      filter.courierPlate = plate.trim().toUpperCase();
+    }
+    if (courierId) {
+      filter.courierId = courierId;
+    }
+
+    const shipments = await Shipment.find(filter).lean();
+
     return res.json({
-      lockerId,
-      lockerToken: locker.lockerToken,
+      ok: true,
+      data: shipments.map((s) => ({
+        shipmentId: s._id,
+        resi: s.resi,
+        lockerId: s.lockerId,
+        courierType: s.courierType,
+        courierPlate: s.courierPlate,
+        customerId: s.customerId,
+        token: s.token, // 🔹 ini yang nanti dipakai di deposit-token
+        status: s.status,
+      })),
     });
   } catch (err) {
-    console.error("GET /api/locker/:lockerId/token error:", err);
+    console.error("GET /api/courier/tasks-token error:", err);
     return res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// Kurir titip paket ke locker
+// 🔹 Kurir deposit paket pakai shipmentToken + lockerToken (mode baru)
+app.post("/api/courier/deposit-token", async (req, res) => {
+  try {
+    const { lockerId, lockerToken, shipmentToken, resi } = req.body;
+
+    if (!lockerId || !lockerToken || !shipmentToken || !resi) {
+      return res.status(400).json({
+        error: "lockerId, lockerToken, shipmentToken, dan resi wajib diisi",
+      });
+    }
+
+    const locker = await Locker.findOne({ lockerId });
+    if (!locker) {
+      return res.status(404).json({ error: "Locker tidak ditemukan" });
+    }
+
+    // Validasi lockerToken (QR dari ESP32)
+    if (!locker.lockerToken || locker.lockerToken !== lockerToken.trim()) {
+      return res
+        .status(400)
+        .json({ error: "Locker token tidak valid / kadaluarsa" });
+    }
+
+    // Cari pending shipment di pool baru
+    const idx = locker.pendingShipments.findIndex(
+      (p) =>
+        p.resi === resi &&
+        p.token === shipmentToken &&
+        p.status === "pending"
+    );
+
+    if (idx === -1) {
+      return res.status(400).json({
+        error:
+          "Token atau resi tidak cocok dengan shipment pending di locker ini",
+      });
+    }
+
+    const pending = locker.pendingShipments[idx];
+
+    // Update pendingShipments -> used
+    locker.pendingShipments[idx].status = "used";
+
+    // Update shipment utama
+    const shipment = await Shipment.findOne({
+      resi,
+      token: shipmentToken,
+      lockerId,
+    });
+
+    if (!shipment) {
+      return res
+        .status(404)
+        .json({ error: "Shipment utama tidak ditemukan" });
+    }
+
+    shipment.status = "delivered_to_locker";
+    shipment.deliveredToLockerAt = new Date();
+    shipment.logs.push({
+      event: "delivered_to_locker",
+      lockerId,
+      resi,
+      timestamp: new Date(),
+      extra: { source: "courier_deposit_token" },
+    });
+    await shipment.save();
+
+    // command untuk ESP32
+    locker.command = {
+      type: "open",
+      resi,
+      source: "courier_token",
+      createdAt: new Date(),
+      customerId: pending.customerId,
+    };
+
+    // still keep pendingResi lama sebagai fallback
+    locker.pendingResi = locker.pendingResi.filter((r) => r !== resi);
+
+    await locker.save();
+
+    // Optional: recalc courier state
+    if (shipment.courierId) {
+      await recalcCourierState(shipment.courierId);
+    }
+
+    return res.json({
+      ok: true,
+      message: "Deposit berhasil, locker akan dibuka",
+      data: {
+        lockerId,
+        resi,
+        customerId: pending.customerId,
+      },
+    });
+  } catch (err) {
+    console.error("POST /api/courier/deposit-token error:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Mark shipment as delivered to customer (called when package is picked up)
+app.post("/api/shipments/:resi/delivered-customer", async (req, res) => {
+  try {
+    const { resi } = req.params;
+
+    const shipment = await Shipment.findOneAndUpdate(
+      { resi },
+      {
+        status: "delivered_to_customer",
+        deliveredToCustomerAt: new Date(),
+      },
+      { new: true }
+    );
+
+    if (!shipment) {
+      return res.status(404).json({ error: "Shipment not found" });
+    }
+
+    // hapus resi dari pendingResi locker
+    await Locker.updateOne(
+      { lockerId: shipment.lockerId },
+      { $pull: { pendingResi: resi } }
+    );
+
+    // Recalculate state kurir yang mengantar shipment ini
+    if (shipment.courierId) {
+      await recalcCourierState(shipment.courierId);
+    }
+
+    res.json({ ok: true, data: shipment });
+  } catch (err) {
+    console.error("POST /api/shipments/:resi/delivered-customer error:", err);
+    res.status(500).json({ error: "Failed to mark delivered" });
+  }
+});
+
+// Kurir scan locker (QR code scan validation)
+app.post("/api/scan", async (req, res) => {
+  try {
+    const { courierId, lockerId, token, resi } = req.body;
+
+    if (!courierId || !lockerId || !token) {
+      return res.status(400).json({ error: "courierId, lockerId, dan token wajib diisi" });
+    }
+
+    const courier = await Courier.findOne({ courierId });
+    if (!courier) {
+      return res.status(404).json({ error: "Courier not found" });
+    }
+
+    if (courier.state === "inactive") {
+      return res.status(403).json({ error: "Courier is inactive, cannot scan" });
+    }
+
+    // Validate locker token
+    const locker = await Locker.findOne({ lockerId, lockerToken: token });
+    if (!locker) {
+      return res.status(404).json({ error: "Invalid locker or token" });
+    }
+
+    // If resi provided, validate it belongs to this courier and locker
+    if (resi) {
+      const shipment = await Shipment.findOne({
+        resi,
+        courierId,
+        lockerId,
+        status: "pending_locker",
+      });
+
+      if (!shipment) {
+        return res.status(404).json({
+          error: "Resi tidak ditemukan atau tidak sesuai dengan kurir dan locker ini",
+        });
+      }
+    }
+
+    res.json({
+      ok: true,
+      message: "Scan berhasil",
+      lockerId,
+      courierId,
+    });
+  } catch (err) {
+    console.error("POST /api/scan error:", err);
+    res.status(500).json({ error: "Scan failed" });
+  }
+});
+
+// ---------------------- LOCKER LIST / POOL ----------------------
+
+// GET semua locker (untuk Agent Locker Client Pool)
+
+app.get("/api/lockers", async (req, res) => {
+  try {
+    const lockers = await Locker.find();
+    console.log(`[DEBUG] GET /api/lockers - Found ${lockers.length} lockers`);
+    lockers.forEach(locker => {
+      console.log(`[DEBUG] Locker ${locker.lockerId}: lastHeartbeat=${locker.lastHeartbeat}, status=${locker.status}`);
+    });
+    // Status calculation logic
+    const now = new Date();
+    const updatedLockers = lockers.map(locker => {
+      let status = "unknown";
+      if (locker.lastHeartbeat) {
+        const diff = now - new Date(locker.lastHeartbeat);
+        // 2 minutes threshold for online
+        if (diff < 2 * 60 * 1000) {
+          status = "online";
+        } else {
+          status = "offline";
+        }
+      }
+      return {
+        ...locker.toObject(),
+        status,
+      };
+    });
+    return res.json(updatedLockers);
+  } catch (err) {
+    console.error("GET /api/lockers error:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+// GET detail locker
+app.get("/api/lockers/:lockerId", async (req, res) => {
+  try {
+    const locker = await Locker.findOne({
+      lockerId: req.params.lockerId,
+    }).lean();
+
+    if (!locker) return res.status(404).json({ error: "Locker not found" });
+
+    res.json({ data: locker });
+  } catch (err) {
+    console.error("GET /api/lockers/:lockerId error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// SANITASI: hapus locker
+app.delete("/api/lockers/:lockerId", async (req, res) => {
+  try {
+    await Locker.deleteOne({ lockerId: req.params.lockerId });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /api/lockers/:lockerId error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+// ---------------------- ESP32 & Locker Command ----------------------
+
+// Ambil token locker (QR) untuk ESP32 + HEARTBEAT
+// 1) Heartbeat + get token (dipanggil ESP32)
+app.get("/api/locker/:lockerId/token", async (req, res) => {
+  const { lockerId } = req.params;
+
+  try {
+    let locker = await Locker.findOne({ lockerId });
+
+    if (!locker) {
+      locker = await Locker.create({
+        lockerId,
+        lockerToken: randomToken("LK-" + lockerId),
+        isActive: true,
+        status: "offline",
+      });
+    }
+
+    const now = new Date();
+
+    // update heartbeat + status
+    locker.lastHeartbeat = now;
+    locker.status = "online";
+    await locker.save();
+
+    res.json({
+      lockerId: locker.lockerId,
+      lockerToken: locker.lockerToken,
+    });
+  } catch (err) {
+    console.error("get locker token error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+// Kurir titip paket ke locker (mode lama: token + resi manual)
 app.post("/api/locker/:lockerId/deposit", async (req, res) => {
   try {
     const { lockerId } = req.params;
@@ -799,7 +1383,41 @@ app.post("/api/locker/:lockerId/deposit", async (req, res) => {
   }
 });
 
-// ESP32 polling command
+// 1) Heartbeat + get token (dipanggil ESP32)
+app.get("/api/locker/:lockerId/token", async (req, res) => {
+  const { lockerId } = req.params;
+
+  try {
+    let locker = await Locker.findOne({ lockerId });
+
+    if (!locker) {
+      locker = await Locker.create({
+        lockerId,
+        lockerToken: randomToken("LK-" + lockerId),
+        isActive: true,
+        status: "offline",
+      });
+    }
+
+    const now = new Date();
+
+    // update heartbeat + status
+    locker.lastHeartbeat = now;
+    locker.status = "online";
+    await locker.save();
+
+    res.json({
+      lockerId: locker.lockerId,
+      lockerToken: locker.lockerToken,
+    });
+  } catch (err) {
+    console.error("get locker token error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+// ESP32 polling command (open, dsb.)
 app.get("/api/locker/:lockerId/command", async (req, res) => {
   try {
     const { lockerId } = req.params;
@@ -821,6 +1439,25 @@ app.get("/api/locker/:lockerId/command", async (req, res) => {
     });
   } catch (err) {
     console.error("GET /api/locker/:lockerId/command error:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ESP32 heartbeat - dipanggil berkala oleh ESP32
+app.post("/api/locker/:lockerId/heartbeat", async (req, res) => {
+  try {
+    const { lockerId } = req.params;
+    const locker = await Locker.findOne({ lockerId });
+    if (!locker) {
+      return res.status(404).json({ error: "Locker not found" });
+    }
+    locker.status = "online";
+    locker.lastHeartbeat = new Date();
+    await locker.save();
+    console.log(`[HEARTBEAT] Locker ${lockerId} at ${locker.lastHeartbeat}`);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("POST /api/locker/:lockerId/heartbeat error:", err);
     return res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -866,6 +1503,8 @@ app.post("/api/locker/:lockerId/log", async (req, res) => {
   }
 });
 
+// ---------------------- Binderbyte Proxy ----------------------
+
 // Proxy tracking umum ke Binderbyte
 app.get("/api/track", async (req, res) => {
   try {
@@ -894,7 +1533,8 @@ app.get("/api/track", async (req, res) => {
   }
 });
 
-// === DEBUG ENDPOINTS ===
+// ---------------------- DEBUG ----------------------
+
 app.get("/api/debug/locker/:lockerId", async (req, res) => {
   try {
     const locker = await getLocker(req.params.lockerId);
@@ -916,7 +1556,9 @@ app.get("/api/debug/shipment/:resi", async (req, res) => {
   }
 });
 
-// === START SERVER ===
+// ==================================================
+// START SERVER
+// ==================================================
 app.listen(PORT, () => {
   console.log(`Smart Locker backend running at http://localhost:${PORT}`);
 });

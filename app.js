@@ -233,6 +233,41 @@ const CustomerTracking = model(
 );
 
 /**
+ * ValidResiCache - MongoDB cache for validated resi numbers
+ * Stores validated resi with courier type to avoid brute-force validation
+ */
+const validResiCacheSchema = new Schema(
+  {
+    resi: { type: String, required: true, unique: true, index: true },
+    courierType: { type: String, required: true }, // jne, jnt, anteraja, sicepat, ninja, pos
+    validatedAt: { type: Date, default: Date.now },
+    validatedCount: { type: Number, default: 1 }, // How many times checked
+    lastCheckedAt: { type: Date, default: Date.now },
+    binderbyteData: {
+      summary: { type: Object },
+      detail: { type: Array },
+      history: { type: Array }
+    },
+    expiresAt: { type: Date, default: null } // Optional: auto-expire cache after X days
+  },
+  {
+    collection: 'valid_resi_cache',
+    timestamps: true
+  }
+);
+
+// Add indexes for fast lookup
+validResiCacheSchema.index({ resi: 1 });
+validResiCacheSchema.index({ courierType: 1 });
+validResiCacheSchema.index({ validatedAt: -1 });
+
+const ValidResiCache = model(
+  "ValidResiCache",
+  validResiCacheSchema,
+  "valid_resi_cache"
+);
+
+/**
  * Courier (kurir)
  */
 const courierSchema = new Schema(
@@ -776,7 +811,7 @@ app.delete("/api/shipments/:id", async (req, res) => {
   }
 });
 
-// Validasi resi via Binderbyte (untuk Agent)
+// Validasi resi via Binderbyte (untuk Agent) - UPDATED with cache support
 app.get("/api/validate-resi", async (req, res) => {
   try {
     const { courier, resi } = req.query;
@@ -785,6 +820,29 @@ app.get("/api/validate-resi", async (req, res) => {
       return res
         .status(400)
         .json({ valid: false, error: "courier dan resi wajib diisi" });
+    }
+
+    const cleanResi = resi.trim().toUpperCase();
+
+    // Check cache first
+    const cachedResi = await ValidResiCache.findOne({ resi: cleanResi });
+    
+    if (cachedResi && cachedResi.courierType === courier) {
+      console.log(`[CACHE HIT] validate-resi: ${cleanResi} → ${courier}`);
+      
+      // Update cache stats
+      cachedResi.validatedCount += 1;
+      cachedResi.lastCheckedAt = new Date();
+      await cachedResi.save();
+      
+      return res.json({
+        valid: true,
+        fromCache: true,
+        data: {
+          status: 200,
+          data: cachedResi.binderbyteData
+        }
+      });
     }
 
     if (! BINDER_KEY) {
@@ -799,9 +857,34 @@ app.get("/api/validate-resi", async (req, res) => {
       params: {
         api_key: BINDER_KEY,
         courier,
-        awb: resi,
+        awb: cleanResi,
       },
     });
+
+    // Save to cache on successful validation
+    if (response.data?.status === 200 && response.data.data?.summary) {
+      try {
+        await ValidResiCache.findOneAndUpdate(
+          { resi: cleanResi },
+          {
+            resi: cleanResi,
+            courierType: courier,
+            validatedAt: new Date(),
+            lastCheckedAt: new Date(),
+            binderbyteData: {
+              summary: response.data.data.summary,
+              detail: response.data.data.detail,
+              history: response.data.data.history
+            },
+            $inc: { validatedCount: 1 }
+          },
+          { upsert: true, new: true }
+        );
+        console.log(`[CACHE SAVED] validate-resi: ${cleanResi} → ${courier}`);
+      } catch (cacheErr) {
+        console.error(`[CACHE ERROR] Failed to save ${cleanResi}:`, cacheErr.message);
+      }
+    }
 
     return res.json({
       valid: true,
@@ -854,7 +937,53 @@ app.post("/api/customer/manual-resi", auth, async (req, res) => {
       });
     }
 
-    // ✅ STEP 2: CHECK BINDERBYTE API KEY
+    // ✅ STEP 2: CHECK MONGODB CACHE FIRST (NEW - FAST PATH!)
+    const cachedResi = await ValidResiCache.findOne({ resi: cleanResi });
+
+    if (cachedResi) {
+      console.log(`[CACHE HIT] Resi ${cleanResi} found in cache: ${cachedResi.courierType}`);
+      
+      // Update cache stats
+      cachedResi.validatedCount += 1;
+      cachedResi.lastCheckedAt = new Date();
+      await cachedResi.save();
+      
+      // Save to CustomerTracking if not exists
+      await CustomerTracking.create({
+        resi: cleanResi,
+        courierType: cachedResi.courierType,
+        customerId: userId,
+        note: `✅ Validated from cache (${cachedResi.courierType})`,
+        validated: true,
+        validationAttempted: true,
+        binderbyteData: {
+          summary: cachedResi.binderbyteData?.summary,
+          validatedAt: new Date()
+        }
+      });
+      
+      // Return immediately with cached data
+      return res.json({
+        ok: true,
+        message: `Resi dari cache (${cachedResi.courierType.toUpperCase()})`,
+        fromCache: true,
+        data: {
+          resi: cleanResi,
+          courierType: cachedResi.courierType,
+          validated: true,
+          tracking: {
+            summary: cachedResi.binderbyteData?.summary,
+            detail: cachedResi.binderbyteData?.detail,
+            history: cachedResi.binderbyteData?.history
+          },
+          cachedAt: cachedResi.validatedAt
+        }
+      });
+    }
+
+    console.log(`[CACHE MISS] Resi ${cleanResi} not in cache - proceeding with validation`);
+
+    // ✅ STEP 3: CHECK BINDERBYTE API KEY
     if (!BINDER_KEY) {
       console.error('[RESI ERROR] BINDERBYTE_API_KEY not configured!');
       return res.status(503).json({
@@ -863,10 +992,19 @@ app.post("/api/customer/manual-resi", auth, async (req, res) => {
       });
     }
 
-    // ✅ STEP 3: TRY ALL COURIERS WITH BINDERBYTE
-    console.log(`[BINDERBYTE] Validating ${cleanResi} - trying all couriers...`);
+    // ✅ STEP 4: SMART PATTERN DETECTION (prioritize detected courier)
+    let couriers = ['jne', 'jnt', 'anteraja', 'sicepat', 'ninja', 'pos'];
+    const detected = validateResi(cleanResi);
+    
+    if (detected.valid && detected.courierType) {
+      console.log(`[PATTERN] Detected courier from resi format: ${detected.courierType}`);
+      // Move detected courier to front of array
+      couriers = [detected.courierType, ...couriers.filter(c => c !== detected.courierType)];
+    }
 
-    const couriers = ['jne', 'jnt', 'anteraja', 'sicepat', 'ninja', 'pos'];
+    // ✅ STEP 5: TRY ALL COURIERS WITH BINDERBYTE (cache miss only)
+    console.log(`[BINDERBYTE] Validating ${cleanResi} - trying couriers: ${couriers.join(', ')}...`);
+
     const validationStart = Date.now();
     let binderbyteResult = null;
     let validCourier = null;
@@ -890,6 +1028,29 @@ app.post("/api/customer/manual-resi", auth, async (req, res) => {
 
           const validationTime = Date.now() - validationStart;
           console.log(`[BINDERBYTE] ✅ FOUND: ${cleanResi} via ${courier.toUpperCase()} (${validationTime}ms)`);
+          
+          // 🔥 SAVE TO CACHE for future use
+          try {
+            await ValidResiCache.create({
+              resi: cleanResi,
+              courierType: courier,
+              validatedAt: new Date(),
+              validatedCount: 1,
+              lastCheckedAt: new Date(),
+              binderbyteData: {
+                summary: binderbyteResult.summary,
+                detail: binderbyteResult.detail,
+                history: binderbyteResult.history
+              }
+            });
+            console.log(`[CACHE SAVED] ${cleanResi} → ${courier}`);
+          } catch (cacheErr) {
+            // Ignore duplicate key errors
+            if (cacheErr.code !== 11000) {
+              console.error(`[CACHE ERROR] Failed to save ${cleanResi}:`, cacheErr.message);
+            }
+          }
+          
           break;
         }
 
@@ -908,7 +1069,7 @@ app.post("/api/customer/manual-resi", auth, async (req, res) => {
 
     const totalTime = Date.now() - validationStart;
 
-    // ✅ STEP 4: IF NOT FOUND IN ANY COURIER, REJECT
+    // ✅ STEP 6: IF NOT FOUND IN ANY COURIER, REJECT
     if (!binderbyteResult || !validCourier) {
       console.error(`[BINDERBYTE] ❌ REJECTED: ${cleanResi} - not found in any courier (${totalTime}ms)`);
 
@@ -920,7 +1081,7 @@ app.post("/api/customer/manual-resi", auth, async (req, res) => {
       });
     }
 
-    // ✅ STEP 5: SAVE TO DATABASE (only valid resi)
+    // ✅ STEP 7: SAVE TO DATABASE (only valid resi)
     const tracking = await CustomerTracking.create({
       resi: cleanResi,
       courierType: validCourier,
@@ -936,7 +1097,7 @@ app.post("/api/customer/manual-resi", auth, async (req, res) => {
 
     console.log(`[RESI SAVED] ✅ ${cleanResi} for customer ${userId} via ${validCourier.toUpperCase()}`);
 
-    // ✅ STEP 6: SEND NOTIFICATION
+    // ✅ STEP 8: SEND NOTIFICATION
     try {
       await sendNotificationToCustomer(
         userId,
@@ -953,7 +1114,7 @@ app.post("/api/customer/manual-resi", auth, async (req, res) => {
       console.error('[NOTIFICATION] Failed:', notifErr.message);
     }
 
-    // ✅ STEP 7: RETURN SUCCESS WITH TRACKING DATA
+    // ✅ STEP 9: RETURN SUCCESS WITH TRACKING DATA
     return res.json({
       ok: true,
       message: `Resi berhasil divalidasi via ${validCourier.toUpperCase()}`,
@@ -1070,7 +1231,7 @@ app.post("/api/customer/open-locker", auth, async (req, res) => {
   }
 });
 
-// Detail tracking 1 resi (Binderbyte + internal) - FIXED with auto-detect
+// Detail tracking 1 resi (Binderbyte + internal) - UPDATED with cache support
 app.get("/api/customer/track/:resi", async (req, res) => {
   const { resi } = req.params;
   const { courier } = req.query; // Optional now
@@ -1078,25 +1239,36 @@ app.get("/api/customer/track/:resi", async (req, res) => {
   try {
     console.log(`[TRACKING REQUEST] Resi: ${resi}, Courier: ${courier || 'auto-detect'}`);
 
+    const cleanResi = resi.trim().toUpperCase();
+
     // Find shipment in database
-    const shipment = await Shipment.findOne({ resi }).lean();
+    const shipment = await Shipment.findOne({ resi: cleanResi }).lean();
 
     // Find in customer_trackings
-    const tracking = await CustomerTracking.findOne({ resi }).lean();
+    const tracking = await CustomerTracking.findOne({ resi: cleanResi }).lean();
 
     console.log(`[TRACKING] Shipment found: ${!!shipment}, Tracking found: ${!!tracking}`);
 
-    // Auto-detect courier type from multiple sources
+    // Auto-detect courier type from multiple sources (including cache)
     let courierType = courier ||
                       shipment?.courierType ||
                       tracking?.courierType;
+
+    // Check cache for courier type if not yet determined
+    if (!courierType || courierType === 'unknown') {
+      const cachedResi = await ValidResiCache.findOne({ resi: cleanResi });
+      if (cachedResi) {
+        courierType = cachedResi.courierType;
+        console.log(`[TRACKING] Courier type from cache: ${courierType}`);
+      }
+    }
 
     console.log(`[TRACKING] Detected courier type: ${courierType}`);
 
     // If still no courier type, try to detect from resi or default to anteraja
     if (!courierType || courierType === 'unknown') {
       // Try common courier detection based on resi pattern
-      if (resi.length === 14 && resi.startsWith('1')) {
+      if (cleanResi.length === 14 && cleanResi.startsWith('1')) {
         courierType = 'anteraja';
         console.log(`[TRACKING] Auto-detected anteraja from resi pattern`);
       } else {
@@ -1120,7 +1292,7 @@ app.get("/api/customer/track/:resi", async (req, res) => {
       console.log(`[TRACKING] Returning internal data only (Binderbyte skipped)`);
       return res.json({
         ok: true,
-        resi,
+        resi: cleanResi,
         courierType,
         internal: internalData,
         binderbyte: null,
@@ -1129,66 +1301,118 @@ app.get("/api/customer/track/:resi", async (req, res) => {
       });
     }
 
-    // Try Binderbyte with shorter timeout for mobile
+    // Try cache first before Binderbyte
     let binderbyte = null;
     let usingCachedData = false;
+    let fromValidResiCache = false;
 
-    try {
-      console.log(`[TRACKING] Fetching ${resi} from Binderbyte (${courierType})...`);
+    const cachedResi = await ValidResiCache.findOne({ resi: cleanResi });
+    
+    if (cachedResi && cachedResi.binderbyteData) {
+      console.log(`[CACHE HIT] track/:resi: ${cleanResi} → ${cachedResi.courierType}`);
+      
+      // Update cache stats
+      cachedResi.validatedCount += 1;
+      cachedResi.lastCheckedAt = new Date();
+      await cachedResi.save();
+      
+      binderbyte = {
+        summary: cachedResi.binderbyteData.summary,
+        detail: cachedResi.binderbyteData.detail || [],
+        history: cachedResi.binderbyteData.history || [],
+        cached: true,
+        cachedAt: cachedResi.validatedAt
+      };
+      usingCachedData = true;
+      fromValidResiCache = true;
+      courierType = cachedResi.courierType; // Use cached courier type
+      
+      console.log(`[TRACKING] ✅ Using ValidResiCache data from ${cachedResi.validatedAt}`);
+    } else {
+      // Cache miss - try live Binderbyte API
+      try {
+        console.log(`[TRACKING] Cache miss, fetching ${cleanResi} from Binderbyte (${courierType})...`);
 
-      const bbResp = await axios.get("https://api.binderbyte.com/v1/track", {
-        params: {
-          api_key: BINDER_KEY,
-          courier: courierType,
-          awb: resi,
-        },
-        timeout: 15000, // Reduced to 15 seconds for faster mobile response
-      });
+        const bbResp = await axios.get("https://api.binderbyte.com/v1/track", {
+          params: {
+            api_key: BINDER_KEY,
+            courier: courierType,
+            awb: cleanResi,
+          },
+          timeout: 15000, // Reduced to 15 seconds for faster mobile response
+        });
 
-      if (bbResp.data && bbResp.data.status === 200) {
-        binderbyte = bbResp.data.data;
-        console.log(`[TRACKING] ✅ Live data from Binderbyte for ${resi}`);
-      } else {
-        console.log(`[TRACKING] ⚠️ No data from Binderbyte for ${resi}`);
-      }
-    } catch (bbErr) {
-      console.error(`[TRACKING] Binderbyte error for ${resi}:`, bbErr.message);
-      console.error(`[TRACKING] Error code:`, bbErr.code);
-      console.error(`[TRACKING] Error details:`, bbErr.response?.status || 'No response');
+        if (bbResp.data && bbResp.data.status === 200) {
+          binderbyte = bbResp.data.data;
+          console.log(`[TRACKING] ✅ Live data from Binderbyte for ${cleanResi}`);
+          
+          // Save to cache for future use
+          try {
+            await ValidResiCache.findOneAndUpdate(
+              { resi: cleanResi },
+              {
+                resi: cleanResi,
+                courierType: courierType,
+                validatedAt: new Date(),
+                lastCheckedAt: new Date(),
+                binderbyteData: {
+                  summary: binderbyte.summary,
+                  detail: binderbyte.detail,
+                  history: binderbyte.history
+                },
+                $inc: { validatedCount: 1 }
+              },
+              { upsert: true, new: true }
+            );
+            console.log(`[CACHE SAVED] track/:resi: ${cleanResi} → ${courierType}`);
+          } catch (cacheErr) {
+            console.error(`[CACHE ERROR] Failed to save ${cleanResi}:`, cacheErr.message);
+          }
+        } else {
+          console.log(`[TRACKING] ⚠️ No data from Binderbyte for ${cleanResi}`);
+        }
+      } catch (bbErr) {
+        console.error(`[TRACKING] Binderbyte error for ${cleanResi}:`, bbErr.message);
+        console.error(`[TRACKING] Error code:`, bbErr.code);
+        console.error(`[TRACKING] Error details:`, bbErr.response?.status || 'No response');
 
-      // 🔥 FALLBACK: Use cached Binderbyte data from customer_trackings if available
-      if (tracking?.binderbyteData?.summary) {
-        binderbyte = {
-          summary: tracking.binderbyteData.summary,
-          detail: [],
-          history: [],
-          cached: true,
-          cachedAt: tracking.binderbyteData.validatedAt
-        };
-        usingCachedData = true;
-        console.log(`[TRACKING] ✅ Using cached Binderbyte data from ${tracking.binderbyteData.validatedAt}`);
-      } else {
-        // Still return success with internal data even if Binderbyte fails
-        binderbyte = {
-          error: true,
-          message: "Layanan tracking eksternal sedang sibuk. Data internal tetap tersedia.",
-          code: bbErr.code || 'TIMEOUT',
-          details: bbErr.message
-        };
+        // 🔥 FALLBACK: Use cached Binderbyte data from customer_trackings if available
+        if (tracking?.binderbyteData?.summary) {
+          binderbyte = {
+            summary: tracking.binderbyteData.summary,
+            detail: [],
+            history: [],
+            cached: true,
+            cachedAt: tracking.binderbyteData.validatedAt
+          };
+          usingCachedData = true;
+          console.log(`[TRACKING] ✅ Using cached Binderbyte data from ${tracking.binderbyteData.validatedAt}`);
+        } else {
+          // Still return success with internal data even if Binderbyte fails
+          binderbyte = {
+            error: true,
+            message: "Layanan tracking eksternal sedang sibuk. Data internal tetap tersedia.",
+            code: bbErr.code || 'TIMEOUT',
+            details: bbErr.message
+          };
+        }
       }
     }
 
     // Return combined data - ALWAYS return success with internal data
     res.json({
       ok: true,
-      resi,
+      resi: cleanResi,
       courierType,
       internal: internalData,
       binderbyte: binderbyte,
       hasBinderbyte: (binderbyte && !binderbyte.error) || usingCachedData,
       usingCachedData: usingCachedData,
+      fromValidResiCache: fromValidResiCache,
       message: binderbyte?.error 
         ? "Data tracking internal tersedia (eksternal timeout)" 
+        : fromValidResiCache
+        ? "Menggunakan data tracking dari cache (instant)"
         : usingCachedData 
         ? "Menggunakan data tracking yang tersimpan (cache)"
         : undefined,
@@ -3033,8 +3257,177 @@ app.get("/api/customers/:customerId/stats", async (req, res) => {
 });
 
 // ==================================================
+// RESI CACHE MANAGEMENT ENDPOINTS
+// ==================================================
+
+// GET /api/stats/resi-cache - Monitor cache performance
+app.get("/api/stats/resi-cache", async (req, res) => {
+  try {
+    const totalCached = await ValidResiCache.countDocuments();
+    
+    const byCourier = await ValidResiCache.aggregate([
+      { $group: { _id: "$courierType", count: { $sum: 1 } } },
+      { $sort: { count: -1 } }
+    ]);
+    
+    const mostUsed = await ValidResiCache.find()
+      .sort({ validatedCount: -1 })
+      .limit(10)
+      .lean();
+    
+    const recentlyCached = await ValidResiCache.find()
+      .sort({ validatedAt: -1 })
+      .limit(10)
+      .lean();
+
+    const stats = {
+      totalCached,
+      byCourier: byCourier.map(item => ({
+        courier: item._id,
+        count: item.count
+      })),
+      mostUsed: mostUsed.map(item => ({
+        resi: item.resi,
+        courierType: item.courierType,
+        validatedCount: item.validatedCount,
+        lastCheckedAt: item.lastCheckedAt
+      })),
+      recentlyCached: recentlyCached.map(item => ({
+        resi: item.resi,
+        courierType: item.courierType,
+        validatedAt: item.validatedAt,
+        validatedCount: item.validatedCount
+      }))
+    };
+
+    res.json({
+      ok: true,
+      data: stats
+    });
+  } catch (err) {
+    console.error("GET /api/stats/resi-cache error:", err);
+    res.status(500).json({ error: "Failed to fetch cache statistics" });
+  }
+});
+
+// POST /api/admin/cache-resi - Pre-populate cache from existing CustomerTracking
+app.post("/api/admin/cache-resi", async (req, res) => {
+  try {
+    console.log("[CACHE] Starting bulk cache population from CustomerTracking...");
+
+    const validatedTracking = await CustomerTracking.find({
+      validated: true,
+      courierType: { $exists: true }
+    });
+
+    console.log(`[CACHE] Found ${validatedTracking.length} validated tracking records`);
+
+    let cached = 0;
+    let skipped = 0;
+    let errors = 0;
+
+    for (const track of validatedTracking) {
+      try {
+        await ValidResiCache.findOneAndUpdate(
+          { resi: track.resi },
+          {
+            resi: track.resi,
+            courierType: track.courierType,
+            validatedAt: track.createdAt,
+            lastCheckedAt: new Date(),
+            binderbyteData: {
+              summary: track.binderbyteData?.summary,
+              detail: [],
+              history: []
+            },
+            $inc: { validatedCount: 1 }
+          },
+          { upsert: true, new: true }
+        );
+        cached++;
+      } catch (err) {
+        if (err.code === 11000) {
+          skipped++; // Duplicate
+        } else {
+          errors++;
+          console.error(`[CACHE ERROR] Failed to cache ${track.resi}:`, err.message);
+        }
+      }
+    }
+
+    console.log(`[CACHE] Bulk population complete: ${cached} cached, ${skipped} skipped, ${errors} errors`);
+
+    res.json({
+      ok: true,
+      message: `Cached ${cached} validated resi from CustomerTracking`,
+      stats: {
+        total: validatedTracking.length,
+        cached,
+        skipped,
+        errors
+      }
+    });
+  } catch (err) {
+    console.error("POST /api/admin/cache-resi error:", err);
+    res.status(500).json({ error: "Failed to populate cache", detail: err.message });
+  }
+});
+
+// ==================================================
 // START SERVER
 // ==================================================
 app.listen(PORT, () => {
   console.log(`Smart Locker backend running at http://localhost:${PORT}`);
 });
+
+// ==================================================
+// STARTUP CACHE INITIALIZATION
+// ==================================================
+// Run once on startup to populate cache from existing data
+setTimeout(async () => {
+  try {
+    console.log("[CACHE] Initializing ValidResiCache from existing CustomerTracking data...");
+    
+    const existing = await CustomerTracking.find({
+      validated: true,
+      courierType: { $exists: true }
+    }).limit(1000);
+
+    console.log(`[CACHE] Found ${existing.length} validated tracking records to migrate`);
+
+    let migrated = 0;
+    let skipped = 0;
+
+    for (const track of existing) {
+      try {
+        await ValidResiCache.findOneAndUpdate(
+          { resi: track.resi },
+          {
+            resi: track.resi,
+            courierType: track.courierType,
+            validatedAt: track.createdAt,
+            lastCheckedAt: new Date(),
+            binderbyteData: {
+              summary: track.binderbyteData?.summary,
+              detail: [],
+              history: []
+            },
+            validatedCount: 1
+          },
+          { upsert: true }
+        );
+        migrated++;
+      } catch (err) {
+        if (err.code === 11000) {
+          skipped++; // Already exists
+        } else {
+          console.error(`[CACHE ERROR] Failed to migrate ${track.resi}:`, err.message);
+        }
+      }
+    }
+    
+    console.log(`[CACHE] ✅ Initialization complete: ${migrated} migrated, ${skipped} skipped`);
+  } catch (err) {
+    console.error("[CACHE] ❌ Initialization failed:", err.message);
+  }
+}, 10000); // 10 seconds after startup

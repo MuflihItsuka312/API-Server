@@ -2904,46 +2904,42 @@ app.get("/api/customers/:customerId/stats", async (req, res) => {
 // ==================================================
 async function migrateCouriers() {
   try {
-    const couriers = await Courier.find({});
-    let migrated = 0;
+    // Check if migration has already run by looking for any courier with old 'state' field
+    const needsMigration = await Courier.findOne({ state: { $exists: true } });
     
-    for (const courier of couriers) {
-      let needsSave = false;
-      
-      // Convert old "state" to new "status" if it exists
-      if (courier.state !== undefined) {
-        courier.status = (courier.state === "inactive") ? "inactive" : "active";
-        courier.state = undefined;
-        needsSave = true;
-      }
-      
-      // Remove deprecated fields
-      if (courier.lastActiveAt !== undefined) {
-        courier.lastActiveAt = undefined;
-        needsSave = true;
-      }
-      if (courier.inactiveSince !== undefined) {
-        courier.inactiveSince = undefined;
-        needsSave = true;
-      }
-      
-      if (needsSave) {
-        await courier.save();
-        migrated++;
-      }
+    if (!needsMigration) {
+      console.log(`[MIGRATION] No couriers need migration (already migrated or no old data)`);
+      return;
     }
     
-    if (migrated > 0) {
-      console.log(`[MIGRATION] Updated ${migrated} courier(s) to new schema`);
-    } else {
-      console.log(`[MIGRATION] No couriers needed migration`);
-    }
+    // Use updateMany with $unset to remove old fields and $set to add new status field
+    const result = await Courier.updateMany(
+      { state: { $exists: true } },
+      [
+        {
+          $set: {
+            status: {
+              $cond: {
+                if: { $eq: ["$state", "inactive"] },
+                then: "inactive",
+                else: "active"
+              }
+            }
+          }
+        },
+        {
+          $unset: ["state", "lastActiveAt", "inactiveSince"]
+        }
+      ]
+    );
+    
+    console.log(`[MIGRATION] Updated ${result.modifiedCount} courier(s) to new schema`);
   } catch (err) {
     console.error("[MIGRATION] Error:", err);
   }
 }
 
-// Run migration once on startup (remove this code after first run if desired)
+// Run migration once on startup (only runs if old 'state' field exists)
 setTimeout(migrateCouriers, 5000);
 
 // ==================================================

@@ -241,19 +241,17 @@ const courierSchema = new Schema(
     name: { type: String, required: true },
     company: { type: String, required: true }, // anteraja, jne, jnt, dll
     plate: { type: String, required: true }, // uppercased
-    phone: { type: String }, // ✅ Added for courier registration
-    passwordHash: { type: String }, // ✅ Added for courier authentication
-    state: {
+    phone: { type: String },
+    passwordHash: { type: String },
+    status: {
       type: String,
-      enum: ["active", "ongoing", "inactive"],
-      default: "active", // ✅ Default is active now (instant activation)
+      enum: ["active", "inactive"],
+      default: "active",
     },
-    lastActiveAt: { type: Date, default: Date.now }, // ✅ Track last activity
-    inactiveSince: { type: Date }, // ✅ When courier became inactive
   },
   {
     collection: "couriers",
-    timestamps: true,
+    timestamps: true, // Keep createdAt/updatedAt for reference
   }
 );
 const Courier = model("Courier", courierSchema);
@@ -294,45 +292,10 @@ async function recalcCourierState(courierId) {
   const courier = await Courier.findOne({ courierId });
   if (!courier) return;
 
-  // Check if courier has pending deliveries
-  const pendingCount = await Shipment.countDocuments({
-    courierId,
-    status: "pending_locker", // Not yet delivered to locker
-  });
-
-  let newState = courier.state;
-
-  if (pendingCount > 0) {
-    // Has pending deliveries -> ONGOING
-    newState = "ongoing";
-    courier.lastActiveAt = new Date(); // Update last activity
-  } else {
-    // No pending deliveries -> ACTIVE (not inactive!)
-    newState = "active"; // ✅ Changed from "inactive" to "active"
-    courier.lastActiveAt = new Date(); // Update last activity
-  }
-
-  if (newState !== courier.state) {
-    courier.state = newState;
-    await courier.save();
-    console.log(`[COURIER] ${courierId} -> ${newState}`);
-  } else {
-    // Just update lastActiveAt even if state didn't change
-    courier.lastActiveAt = new Date();
-    await courier.save();
-  }
-}
-
-// Helper: update courier activity timestamp
-async function updateCourierActivity(courierId) {
-  if (!courierId) return;
-
-  const courier = await Courier.findOne({ courierId });
-  if (courier) {
-    courier.lastActiveAt = new Date();
-    await courier.save();
-    console.log(`[COURIER ACTIVITY] ${courierId} last active updated`);
-  }
+  // No automatic status changes
+  // Status only changed manually by agent via API
+  // Just update timestamps if needed
+  console.log(`[COURIER] ${courierId} status: ${courier.status}`);
 }
 
 // Helper: send notification to customer (placeholder - implement with FCM/push service)
@@ -477,84 +440,6 @@ function validateResi(resi) {
 }
 
 // ==================================================
-// AUTO-CLEANUP INACTIVE COURIERS
-// ==================================================
-
-// Mark couriers as inactive if no activity for 7 days
-async function checkInactiveCouriers() {
-  try {
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-
-    // Find active/ongoing couriers who haven't been active in 7 days
-    const inactiveCouriers = await Courier.find({
-      state: { $in: ["active", "ongoing"] },
-      lastActiveAt: { $lt: sevenDaysAgo },
-    });
-
-    for (const courier of inactiveCouriers) {
-      courier.state = "inactive";
-      courier.inactiveSince = new Date();
-      await courier.save();
-      console.log(`[AUTO-CLEANUP] ${courier.courierId} marked as INACTIVE (no activity for 7 days)`);
-    }
-
-    if (inactiveCouriers.length > 0) {
-      console.log(`[AUTO-CLEANUP] ${inactiveCouriers.length} couriers marked as inactive`);
-    }
-  } catch (err) {
-    console.error("[AUTO-CLEANUP] Error checking inactive couriers:", err);
-  }
-}
-
-// Delete couriers who have been inactive for 7+ days
-async function deleteOldInactiveCouriers() {
-  try {
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-
-    // Find inactive couriers who have been inactive for 7+ days
-    const deleteCandidates = await Courier.find({
-      state: "inactive",
-      inactiveSince: { $lt: sevenDaysAgo },
-    });
-
-    for (const courier of deleteCandidates) {
-      // Check if they have any completed deliveries
-      const deliveryCount = await Shipment.countDocuments({
-        courierId: courier.courierId,
-      });
-
-      if (deliveryCount === 0) {
-        // No deliveries ever made, safe to delete
-        await Courier.deleteOne({ courierId: courier.courierId });
-        console.log(`[AUTO-CLEANUP] DELETED ${courier.courierId} (inactive for 7+ days, no deliveries)`);
-      } else {
-        // Has delivery history, keep for records but mark
-        console.log(`[AUTO-CLEANUP] Keeping ${courier.courierId} (has ${deliveryCount} delivery records)`);
-      }
-    }
-
-    if (deleteCandidates.length > 0) {
-      console.log(`[AUTO-CLEANUP] Processed ${deleteCandidates.length} inactive couriers`);
-    }
-  } catch (err) {
-    console.error("[AUTO-CLEANUP] Error deleting inactive couriers:", err);
-  }
-}
-
-// Run cleanup every hour
-setInterval(() => {
-  checkInactiveCouriers();
-  deleteOldInactiveCouriers();
-}, 60 * 60 * 1000); // 1 hour
-
-// Run immediately on startup
-setTimeout(() => {
-  console.log("[AUTO-CLEANUP] Running initial cleanup check...");
-  checkInactiveCouriers();
-  deleteOldInactiveCouriers();
-}, 5000); // 5 seconds after startup
-
-// ==================================================
 // ROUTES
 // ==================================================
 
@@ -661,10 +546,10 @@ app.post("/api/shipments", async (req, res) => {
       if (!courier) {
         return res.status(404).json({ error: "Courier not found" });
       }
-      if (courier.state !== "active") {
+      if (courier.status !== "active") {
         return res
           .status(400)
-          .json({ error: `Courier ${courierId} not available (state=${courier.state})` });
+          .json({ error: `Courier ${courierId} not available (status=${courier.status})` });
       }
       courierName = courier.name;
     }
@@ -728,13 +613,6 @@ app.post("/api/shipments", async (req, res) => {
     }
 
     await locker.save();
-
-    // Set courier to ONGOING after assignment
-    if (courier) {
-      courier.state = "ongoing";
-      await courier.save();
-      console.log(`[COURIER] ${courierId} -> ongoing (assigned shipments)`);
-    }
 
     return res.json({
       message: "Shipments assigned to locker",
@@ -1212,6 +1090,7 @@ app.get("/api/couriers", async (req, res) => {
   try {
     const couriers = await Courier.find({})
       .sort({ company: 1, name: 1 })
+      .select('courierId name company plate phone status createdAt updatedAt')
       .lean();
     res.json({ ok: true, data: couriers });
   } catch (err) {
@@ -1257,19 +1136,22 @@ app. post("/api/couriers", async (req, res) => {
   }
 });
 
-// Update status kurir (active / ongoing / inactive)
+// Update status kurir (active / inactive)
 app.put("/api/couriers/:courierId/status", async (req, res) => {
   try {
     const { courierId } = req.params;
-    const { state } = req.body;
+    const { status } = req.body;
 
-    if (!state || !["active", "ongoing", "inactive"].includes(state)) {
-      return res. status(400).json({ error: "Invalid state.  Must be: active, ongoing, or inactive" });
+    // Only allow "active" or "inactive"
+    if (!status || !["active", "inactive"].includes(status)) {
+      return res.status(400).json({ 
+        error: "Invalid status. Must be 'active' or 'inactive'" 
+      });
     }
 
     const courier = await Courier.findOneAndUpdate(
       { courierId },
-      { state },
+      { status },
       { new: true }
     );
 
@@ -1277,16 +1159,16 @@ app.put("/api/couriers/:courierId/status", async (req, res) => {
       return res.status(404).json({ error: "Courier not found" });
     }
 
-    console.log(`[AGENT] Courier ${courierId} state changed to: ${state}`);
+    console.log(`[AGENT] Courier ${courierId} status changed to: ${status}`);
 
     res.json({
       ok: true,
-      message: `Status kurir diupdate menjadi ${state}`,
+      message: `Status kurir diubah menjadi ${status}`,
       data: courier,
     });
   } catch (err) {
     console.error("PUT /api/couriers/:courierId/status error:", err);
-    res. status(500).json({ error: "Internal server error" });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -1345,8 +1227,7 @@ app.post("/api/courier/register", async (req, res) => {
       plate: normalizedPlate,
       phone: phone?.trim() || "",
       passwordHash,
-      state: "active",
-      lastActiveAt: new Date(),
+      status: "active",
     });
 
     console.log(`[COURIER REGISTER] ${courierId} (${name}) - ACTIVE`);
@@ -1358,7 +1239,7 @@ app.post("/api/courier/register", async (req, res) => {
         name: courier.name,
         company: courier.company,
         plate: courier.plate,
-        state: courier.state,
+        status: courier.status,
       },
     });
   } catch (err) {
@@ -1401,20 +1282,15 @@ app.post("/api/courier/login", async (req, res) => {
       return res.status(401).json({ error: "Password salah" });
     }
 
-    // Check courier state
-    if (courier.state === "inactive") {
+    // Check courier status
+    if (courier.status === "inactive") {
       return res.status(403).json({
         error: "Akun tidak aktif. Silakan hubungi admin.",
       });
     }
 
-    // Update last active
-    courier.lastActiveAt = new Date();
-    if (courier.state === "inactive") {
-      courier.state = "active";
-      courier.inactiveSince = null;
-    }
-    await courier.save();
+    // Don't auto-change status on login
+    // Status only changed by agent manually
 
     // Generate JWT token
     const token = jwt.sign(
@@ -1438,7 +1314,7 @@ app.post("/api/courier/login", async (req, res) => {
         name: courier.name,
         company: courier.company,
         plate: courier.plate,
-        state: courier.state,
+        status: courier.status,
       },
     });
   } catch (err) {
@@ -1476,7 +1352,7 @@ app.get("/api/courier/profile", authCourier, async (req, res) => {
         company: courier.company,
         plate: courier.plate,
         phone: courier.phone,
-        state: courier.state,
+        status: courier.status,
         stats: {
           totalDeliveries,
           pendingDeliveries,
@@ -1588,7 +1464,7 @@ app.post("/api/courier/login-legacy", async (req, res) => {
         .json({ error: "Kurir tidak terdaftar." });
     }
 
-    if (courier.state === "inactive") {
+    if (courier.status === "inactive") {
       return res
         .status(401)
         .json({ error: "Kurir sudah tidak aktif.  Hubungi admin untuk aktivasi kembali." });
@@ -1829,9 +1705,6 @@ app.post("/api/courier/deposit", async (req, res) => {
 
     console.log(`[COURIER DEPOSIT-PLATE] Match found! Resi: ${shipment.resi}`);
 
-    // ✅ Update courier activity
-    await updateCourierActivity(shipment.courierId);
-
     shipment.status = "delivered_to_locker";
     shipment.deliveredToLockerAt = new Date();
     shipment.logs.push({
@@ -1871,7 +1744,7 @@ app.post("/api/courier/deposit", async (req, res) => {
 
     console.log(`[TOKEN ROTATE] ${locker.lockerId}: ${oldToken} → ${locker.lockerToken}`);
 
-    // Recalc courier state after delivery (stays ongoing until all delivered to customer)
+    // Log courier status (status no longer auto-updates)
     if (shipment.courierId) {
       await recalcCourierState(shipment.courierId);
     }
@@ -2015,9 +1888,6 @@ app.post("/api/courier/deposit-resi", async (req, res) => {
 
     console.log(`[DEPOSIT] Processing resi ${resi} for locker ${lockerId}`);
 
-    // ✅ Update courier activity
-    await updateCourierActivity(shipment.courierId);
-
     shipment.status = "delivered_to_locker";
     shipment.deliveredToLockerAt = new Date();
     shipment.logs.push({
@@ -2132,7 +2002,7 @@ app.post("/api/scan", async (req, res) => {
       return res. status(404).json({ error: "Courier not found" });
     }
 
-    if (courier.state === "inactive") {
+    if (courier.status === "inactive") {
       return res.status(403).json({ error: "Courier is inactive, cannot scan" });
     }
 
@@ -2319,9 +2189,6 @@ app.post("/api/locker/:lockerId/deposit", async (req, res) => {
     if (!shipment) {
       return res.status(404).json({ error: "Shipment/resi tidak ditemukan" });
     }
-
-    // ✅ Update courier activity
-    await updateCourierActivity(shipment.courierId);
 
     shipment.status = "delivered_to_locker";
     shipment.deliveredToLockerAt = new Date();
@@ -3031,6 +2898,53 @@ app.get("/api/customers/:customerId/stats", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch customer stats" });
   }
 });
+
+// ==================================================
+// DATABASE MIGRATION - Run once to migrate courier data
+// ==================================================
+async function migrateCouriers() {
+  try {
+    const couriers = await Courier.find({});
+    let migrated = 0;
+    
+    for (const courier of couriers) {
+      let needsSave = false;
+      
+      // Convert old "state" to new "status" if it exists
+      if (courier.state !== undefined) {
+        courier.status = (courier.state === "inactive") ? "inactive" : "active";
+        courier.state = undefined;
+        needsSave = true;
+      }
+      
+      // Remove deprecated fields
+      if (courier.lastActiveAt !== undefined) {
+        courier.lastActiveAt = undefined;
+        needsSave = true;
+      }
+      if (courier.inactiveSince !== undefined) {
+        courier.inactiveSince = undefined;
+        needsSave = true;
+      }
+      
+      if (needsSave) {
+        await courier.save();
+        migrated++;
+      }
+    }
+    
+    if (migrated > 0) {
+      console.log(`[MIGRATION] Updated ${migrated} courier(s) to new schema`);
+    } else {
+      console.log(`[MIGRATION] No couriers needed migration`);
+    }
+  } catch (err) {
+    console.error("[MIGRATION] Error:", err);
+  }
+}
+
+// Run migration once on startup (remove this code after first run if desired)
+setTimeout(migrateCouriers, 5000);
 
 // ==================================================
 // START SERVER

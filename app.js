@@ -1095,38 +1095,38 @@ app.get("/api/couriers", async (req, res) => {
     res.json({ ok: true, data: couriers });
   } catch (err) {
     console.error("GET /api/couriers error:", err);
-    res.status(500). json({ error: "Internal server error" });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
 // Tambah kurir baru
-app. post("/api/couriers", async (req, res) => {
+app.post("/api/couriers", async (req, res) => {
   try {
     let { name, company, plate } = req.body;
 
     if (!name || !company || !plate) {
       return res
         .status(400)
-        . json({ error: "name, company, dan plate wajib diisi" });
+        .json({ error: "name, company, dan plate wajib diisi" });
     }
 
     name = name.trim();
-    company = company.trim(). toLowerCase();
+    company = company.trim().toLowerCase();
     plate = plate.trim().toUpperCase();
 
     const exists = await Courier.findOne({ plate, company });
     if (exists) {
-      return res. status(400).json({
+      return res.status(400).json({
         error: "Kurir dengan plat & perusahaan ini sudah terdaftar",
       });
     }
 
     const courier = await Courier.create({
-      courierId: "CR-" + company.toUpperCase(). slice(0, 3) + "-" + Date.now(),
+      courierId: "CR-" + company.toUpperCase().slice(0, 3) + "-" + Date.now(),
       name,
       company,
       plate,
-      state: "active",
+      status: "active",
     });
 
     res.json({ ok: true, message: "Kurir berhasil ditambahkan", data: courier });

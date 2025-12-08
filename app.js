@@ -3260,8 +3260,8 @@ app.get("/api/customers/:customerId/stats", async (req, res) => {
 // RESI CACHE MANAGEMENT ENDPOINTS
 // ==================================================
 
-// GET /api/stats/resi-cache - Monitor cache performance
-app.get("/api/stats/resi-cache", async (req, res) => {
+// GET /api/stats/resi-cache - Monitor cache performance (requires authentication)
+app.get("/api/stats/resi-cache", auth, async (req, res) => {
   try {
     const totalCached = await ValidResiCache.countDocuments();
     
@@ -3310,9 +3310,14 @@ app.get("/api/stats/resi-cache", async (req, res) => {
   }
 });
 
-// POST /api/admin/cache-resi - Pre-populate cache from existing CustomerTracking
-app.post("/api/admin/cache-resi", async (req, res) => {
+// POST /api/admin/cache-resi - Pre-populate cache from existing CustomerTracking (requires authentication)
+app.post("/api/admin/cache-resi", auth, async (req, res) => {
   try {
+    // Optional: Check if user is admin (uncomment if needed)
+    // if (req.user.role !== 'admin') {
+    //   return res.status(403).json({ error: "Admin access required" });
+    // }
+
     console.log("[CACHE] Starting bulk cache population from CustomerTracking...");
 
     const validatedTracking = await CustomerTracking.find({

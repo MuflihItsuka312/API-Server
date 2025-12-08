@@ -159,6 +159,20 @@ const lockerSchema = new Schema(
       default: [],
     },
 
+    // 🔍 DEBUG info untuk pengujian waktu respon
+    debugInfo: {
+      type: {
+        enabled: { type: Boolean, default: false },
+        resi: String,
+        scanAtClient: Date,   // waktu di app kurir (opsional)
+        scanAtBackend: Date,  // waktu request masuk backend
+        commandSentAt: Date,  // waktu ESP ambil command
+        espLogAt: Date,       // waktu ESP kirim log "locker_opened"
+        lastEvent: String,
+      },
+      default: null,
+    },
+
     // List of pending resi numbers for this locker
     pendingResi: { type: [String], default: [] },
 
@@ -327,6 +341,31 @@ async function sendNotificationToCustomer(userId, title, message, data = {}) {
   console.log(`[NOTIFICATION] To customer ${userId}: ${title} - ${message}`, data);
   // For now, just log. In production, send via FCM/OneSignal/etc.
   return Promise.resolve();
+}
+
+// 🔍 Helper: Log debug phases for QR scan timing analysis (thesis)
+function pushDebugPhase(locker, phase, extra = {}) {
+  if (!locker) return;
+  if (!locker.debugInfo) locker.debugInfo = { enabled: false };
+
+  const now = new Date();
+
+  if (phase === "scan") {
+    locker.debugInfo.enabled = true;
+    locker.debugInfo.scanAtBackend = now;
+  } else if (phase === "command") {
+    locker.debugInfo.commandSentAt = now;
+  } else if (phase === "esp_log") {
+    locker.debugInfo.espLogAt = now;
+  }
+
+  locker.debugInfo.lastEvent = phase;
+  Object.assign(locker.debugInfo, extra);
+
+  console.log(
+    `[DEBUG-QR] phase=${phase} locker=${locker.lockerId} resi=${locker.debugInfo.resi || "-"} info=`,
+    locker.debugInfo
+  );
 }
 
 // Auth middleware (JWT)
@@ -1092,6 +1131,7 @@ app.get("/api/customer/track/:resi", async (req, res) => {
 
     // Try Binderbyte with shorter timeout for mobile
     let binderbyte = null;
+    let usingCachedData = false;
 
     try {
       console.log(`[TRACKING] Fetching ${resi} from Binderbyte (${courierType})...`);
@@ -1107,7 +1147,7 @@ app.get("/api/customer/track/:resi", async (req, res) => {
 
       if (bbResp.data && bbResp.data.status === 200) {
         binderbyte = bbResp.data.data;
-        console.log(`[TRACKING] ✅ Success for ${resi}`);
+        console.log(`[TRACKING] ✅ Live data from Binderbyte for ${resi}`);
       } else {
         console.log(`[TRACKING] ⚠️ No data from Binderbyte for ${resi}`);
       }
@@ -1116,13 +1156,26 @@ app.get("/api/customer/track/:resi", async (req, res) => {
       console.error(`[TRACKING] Error code:`, bbErr.code);
       console.error(`[TRACKING] Error details:`, bbErr.response?.status || 'No response');
 
-      // Still return success with internal data even if Binderbyte fails
-      binderbyte = {
-        error: true,
-        message: "Layanan tracking eksternal sedang sibuk. Data internal tetap tersedia.",
-        code: bbErr.code || 'TIMEOUT',
-        details: bbErr.message
-      };
+      // 🔥 FALLBACK: Use cached Binderbyte data from customer_trackings if available
+      if (tracking?.binderbyteData?.summary) {
+        binderbyte = {
+          summary: tracking.binderbyteData.summary,
+          detail: [],
+          history: [],
+          cached: true,
+          cachedAt: tracking.binderbyteData.validatedAt
+        };
+        usingCachedData = true;
+        console.log(`[TRACKING] ✅ Using cached Binderbyte data from ${tracking.binderbyteData.validatedAt}`);
+      } else {
+        // Still return success with internal data even if Binderbyte fails
+        binderbyte = {
+          error: true,
+          message: "Layanan tracking eksternal sedang sibuk. Data internal tetap tersedia.",
+          code: bbErr.code || 'TIMEOUT',
+          details: bbErr.message
+        };
+      }
     }
 
     // Return combined data - ALWAYS return success with internal data
@@ -1132,8 +1185,13 @@ app.get("/api/customer/track/:resi", async (req, res) => {
       courierType,
       internal: internalData,
       binderbyte: binderbyte,
-      hasBinderbyte: binderbyte && !binderbyte.error,
-      message: binderbyte?.error ? "Data tracking internal tersedia (eksternal timeout)" : undefined,
+      hasBinderbyte: (binderbyte && !binderbyte.error) || usingCachedData,
+      usingCachedData: usingCachedData,
+      message: binderbyte?.error 
+        ? "Data tracking internal tersedia (eksternal timeout)" 
+        : usingCachedData 
+        ? "Menggunakan data tracking yang tersimpan (cache)"
+        : undefined,
     });
 
   } catch (err) {
@@ -1872,9 +1930,9 @@ app.get("/api/courier/tasks", async (req, res) => {
 // Implements ONE-TIME TOKEN with courier history tracking
 app.post("/api/courier/deposit-resi", async (req, res) => {
   try {
-    const { lockerId, lockerToken, resi } = req.body;
+    const { lockerId, lockerToken, resi, debug, scanAtClient } = req.body;
 
-    console.log(`[COURIER DEPOSIT-RESI] Attempt: lockerId=${lockerId}, resi=${resi}, token=${lockerToken?.substring(0, 15)}...`);
+    console.log(`[COURIER DEPOSIT-RESI] Attempt: lockerId=${lockerId}, resi=${resi}, token=${lockerToken?.substring(0, 15)}..., debug=${debug}`);
 
     if (!lockerId || !lockerToken || ! resi) {
       console.log(`[COURIER DEPOSIT-RESI] Missing fields: lockerId=${!!lockerId}, token=${!!lockerToken}, resi=${!!resi}`);
@@ -1885,7 +1943,22 @@ app.post("/api/courier/deposit-resi", async (req, res) => {
 
     const locker = await Locker.findOne({ lockerId });
     if (!locker) {
-      return res. status(404).json({ error: "Locker tidak ditemukan" });
+      return res.status(404).json({ error: "Locker tidak ditemukan" });
+    }
+
+    // 🔍 DEBUG: tandai waktu scan di backend (dan optional dari client)
+    if (debug) {
+      const clientTime = scanAtClient ? new Date(scanAtClient) : null;
+      locker.debugInfo = locker.debugInfo || {};
+      locker.debugInfo.enabled = true;
+      locker.debugInfo.resi = resi;
+      locker.debugInfo.scanAtBackend = new Date();
+      if (clientTime) locker.debugInfo.scanAtClient = clientTime;
+
+      console.log(
+        `[DEBUG-QR] START locker=${lockerId} resi=${resi} scanAtBackend=${locker.debugInfo.scanAtBackend.toISOString()}` +
+          (clientTime ? ` scanAtClient=${clientTime.toISOString()}` : "")
+      );
     }
 
     // Validasi lockerToken (QR dari ESP32)
@@ -2314,10 +2387,25 @@ app.get("/api/locker/:lockerId/command", async (req, res) => {
     }
 
     const cmd = locker.command;
+
+    // 🔍 DEBUG: catat kapan ESP32 menarik command (polling)
+    if (locker.debugInfo?.enabled) {
+      pushDebugPhase(locker, "command", { resi: cmd.resi });
+
+      // Hitung durasi dari scan (backend) ke command diambil ESP
+      if (locker.debugInfo.scanAtBackend) {
+        const diffMs =
+          new Date() - new Date(locker.debugInfo.scanAtBackend);
+        console.log(
+          `[DEBUG-QR] Δ scan(backend) → command(ESP poll) = ${diffMs} ms (locker=${lockerId}, resi=${cmd.resi})`
+        );
+      }
+    }
+
     locker.command = null; // one-shot
     await locker.save();
 
-    console.log(`[COMMAND] Sent to ${lockerId}: ${cmd. type}`);
+    console.log(`[COMMAND] Sent to ${lockerId}: ${cmd.type}`);
 
     return res.json({
       command: cmd.type,
@@ -2364,6 +2452,34 @@ app.post("/api/locker/:lockerId/log", async (req, res) => {
       extra: extra || null,
       timestamp: new Date(),
     };
+
+    // 🔍 DEBUG: kalau event dari ESP adalah buka loker, hitung total waktu
+    if (["locker_opened", "opened_by_courier"].includes(event)) {
+      const locker = await Locker.findOne({ lockerId });
+
+      if (locker?.debugInfo?.enabled && locker.debugInfo.scanAtBackend) {
+        pushDebugPhase(locker, "esp_log", { resi });
+
+        const tScanBackend = new Date(locker.debugInfo.scanAtBackend);
+        const tEspLog = logEntry.timestamp;
+
+        const totalMs = tEspLog - tScanBackend;
+        let clientPart = null;
+
+        if (locker.debugInfo.scanAtClient) {
+          clientPart = tScanBackend - new Date(locker.debugInfo.scanAtClient);
+        }
+
+        console.log(
+          `[DEBUG-QR] FINAL locker=${lockerId} resi=${resi} ` +
+            `(scanBackend→espLog = ${totalMs} ms` +
+            (clientPart != null ? `, scanClient→backend = ${clientPart} ms` : "") +
+            `)`
+        );
+
+        await locker.save();
+      }
+    }
 
     if (shipment) {
       shipment.logs.push(logEntry);

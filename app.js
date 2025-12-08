@@ -827,7 +827,7 @@ app.get("/api/validate-resi", async (req, res) => {
 
 // ---------------------- CUSTOMER ENDPOINTS ----------------------
 
-// ==================== CUSTOMER: Input Resi Manual (BINDERBYTE DIRECT VALIDATION) ====================
+// ==================== CUSTOMER: Input Resi Manual (CACHED VALIDATION) ====================
 app.post("/api/customer/manual-resi", auth, async (req, res) => {
   try {
     const { resi } = req.body;
@@ -840,7 +840,7 @@ app.post("/api/customer/manual-resi", auth, async (req, res) => {
     const cleanResi = resi.trim().toUpperCase();
     console.log(`[RESI INPUT] Customer ${userId}: "${cleanResi}"`);
 
-    // ✅ STEP 1: CHECK IF ALREADY EXISTS
+    // ✅ STEP 1: CHECK IF THIS USER ALREADY HAS THIS RESI
     const existing = await CustomerTracking.findOne({
       resi: cleanResi,
       customerId: userId
@@ -854,7 +854,43 @@ app.post("/api/customer/manual-resi", auth, async (req, res) => {
       });
     }
 
-    // ✅ STEP 2: CHECK BINDERBYTE API KEY
+    // ✅ STEP 2: CHECK GLOBAL CACHE (any customer validated this resi before)
+    const cachedResi = await CustomerTracking.findOne({
+      resi: cleanResi,
+      validated: true
+    }).lean();
+
+    if (cachedResi) {
+      console.log(`[RESI CACHE HIT] ${cleanResi} found in cache as ${cachedResi.courierType.toUpperCase()}`);
+      
+      // Create entry for this user using cached data
+      const tracking = await CustomerTracking.create({
+        resi: cleanResi,
+        courierType: cachedResi.courierType,
+        customerId: userId,
+        note: `✅ Validated from cache (${cachedResi.courierType.toUpperCase()})`,
+        validated: true,
+        validationAttempted: true,
+        binderbyteData: cachedResi.binderbyteData || null
+      });
+
+      console.log(`[RESI SAVED] ✅ ${cleanResi} for customer ${userId} via CACHE (${cachedResi.courierType.toUpperCase()})`);
+
+      return res.json({
+        ok: true,
+        message: `Resi berhasil ditambahkan (${cachedResi.courierType.toUpperCase()})`,
+        fromCache: true,
+        data: {
+          resi: cleanResi,
+          courierType: cachedResi.courierType,
+          validated: true,
+          tracking: cachedResi.binderbyteData || null,
+          createdAt: tracking.createdAt
+        }
+      });
+    }
+
+    // ✅ STEP 3: CHECK BINDERBYTE API KEY
     if (!BINDER_KEY) {
       console.error('[RESI ERROR] BINDERBYTE_API_KEY not configured!');
       return res.status(503).json({
@@ -863,15 +899,30 @@ app.post("/api/customer/manual-resi", auth, async (req, res) => {
       });
     }
 
-    // ✅ STEP 3: TRY ALL COURIERS WITH BINDERBYTE
-    console.log(`[BINDERBYTE] Validating ${cleanResi} - trying all couriers...`);
+    // ✅ STEP 4: SMART COURIER DETECTION (reduce brute force)
+    let courierPriority = [];
+    
+    // Pattern-based detection for faster validation
+    if (/^JT\d{10,}/i.test(cleanResi)) {
+      courierPriority = ['jnt', 'jne', 'anteraja', 'sicepat', 'ninja', 'pos'];
+    } else if (/^(JNE|CGK)/i.test(cleanResi)) {
+      courierPriority = ['jne', 'jnt', 'anteraja', 'sicepat', 'ninja', 'pos'];
+    } else if (/^\d{14}$/.test(cleanResi)) {
+      courierPriority = ['anteraja', 'sicepat', 'jnt', 'jne', 'ninja', 'pos'];
+    } else if (/^NLIDAP|^NV/i.test(cleanResi)) {
+      courierPriority = ['ninja', 'jne', 'jnt', 'anteraja', 'sicepat', 'pos'];
+    } else {
+      courierPriority = ['jne', 'jnt', 'anteraja', 'sicepat', 'ninja', 'pos'];
+    }
 
-    const couriers = ['jne', 'jnt', 'anteraja', 'sicepat', 'ninja', 'pos'];
+    console.log(`[BINDERBYTE] Validating ${cleanResi} - smart order: ${courierPriority.join(', ')}...`);
+
     const validationStart = Date.now();
     let binderbyteResult = null;
     let validCourier = null;
 
-    for (const courier of couriers) {
+    // ✅ STEP 5: TRY COURIERS IN SMART ORDER (stop on first success)
+    for (const courier of courierPriority) {
       try {
         console.log(`[BINDERBYTE] Trying ${courier}...`);
 
@@ -881,7 +932,7 @@ app.post("/api/customer/manual-resi", auth, async (req, res) => {
             courier: courier,
             awb: cleanResi,
           },
-          timeout: 8000,
+          timeout: 5000, // Reduced to 5s per courier
         });
 
         if (response.data?.status === 200 && response.data.data?.summary) {
@@ -890,7 +941,7 @@ app.post("/api/customer/manual-resi", auth, async (req, res) => {
 
           const validationTime = Date.now() - validationStart;
           console.log(`[BINDERBYTE] ✅ FOUND: ${cleanResi} via ${courier.toUpperCase()} (${validationTime}ms)`);
-          break;
+          break; // Stop on first match
         }
 
       } catch (err) {
@@ -908,7 +959,7 @@ app.post("/api/customer/manual-resi", auth, async (req, res) => {
 
     const totalTime = Date.now() - validationStart;
 
-    // ✅ STEP 4: IF NOT FOUND IN ANY COURIER, REJECT
+    // ✅ STEP 6: IF NOT FOUND IN ANY COURIER, REJECT
     if (!binderbyteResult || !validCourier) {
       console.error(`[BINDERBYTE] ❌ REJECTED: ${cleanResi} - not found in any courier (${totalTime}ms)`);
 
@@ -920,7 +971,7 @@ app.post("/api/customer/manual-resi", auth, async (req, res) => {
       });
     }
 
-    // ✅ STEP 5: SAVE TO DATABASE (only valid resi)
+    // ✅ STEP 7: SAVE TO DATABASE (only valid resi)
     const tracking = await CustomerTracking.create({
       resi: cleanResi,
       courierType: validCourier,
@@ -981,13 +1032,114 @@ app.post("/api/customer/manual-resi", auth, async (req, res) => {
 // Agent melihat semua resi manual dari user
 app.get("/api/manual-resi", async (req, res) => {
   try {
-    const list = await CustomerTracking.find({})
+    let list = await CustomerTracking.find({})
       .sort({ createdAt: -1 })
-      . lean();
+      .lean();
+    
+    // Fix unknown courier types by marking them
+    list = list.map(item => ({
+      ...item,
+      courierType: item.courierType || 'unknown',
+      needsRevalidation: !item.courierType || item.courierType === 'unknown' || !item.validated
+    }));
+    
     res.json({ data: list });
   } catch (err) {
     console.error("GET /api/manual-resi error:", err);
     res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Revalidate unknown resi (Admin/Agent endpoint)
+app.post("/api/manual-resi/revalidate/:resi", async (req, res) => {
+  try {
+    const { resi } = req.params;
+    const cleanResi = resi.trim().toUpperCase();
+
+    console.log(`[RESI REVALIDATE] Attempting to revalidate ${cleanResi}...`);
+
+    const tracking = await CustomerTracking.findOne({ resi: cleanResi });
+    if (!tracking) {
+      return res.status(404).json({ error: "Resi tidak ditemukan di database" });
+    }
+
+    if (!BINDER_KEY) {
+      return res.status(503).json({ error: "Binderbyte API key tidak tersedia" });
+    }
+
+    // Try smart courier detection
+    let courierPriority = [];
+    if (/^JT\d{10,}/i.test(cleanResi)) {
+      courierPriority = ['jnt', 'jne', 'anteraja', 'sicepat', 'ninja', 'pos'];
+    } else if (/^(JNE|CGK)/i.test(cleanResi)) {
+      courierPriority = ['jne', 'jnt', 'anteraja', 'sicepat', 'ninja', 'pos'];
+    } else if (/^\d{14}$/.test(cleanResi)) {
+      courierPriority = ['anteraja', 'sicepat', 'jnt', 'jne', 'ninja', 'pos'];
+    } else {
+      courierPriority = ['jne', 'jnt', 'anteraja', 'sicepat', 'ninja', 'pos'];
+    }
+
+    let binderbyteResult = null;
+    let validCourier = null;
+
+    for (const courier of courierPriority) {
+      try {
+        console.log(`[REVALIDATE] Trying ${courier}...`);
+        const response = await axios.get("https://api.binderbyte.com/v1/track", {
+          params: {
+            api_key: BINDER_KEY,
+            courier: courier,
+            awb: cleanResi,
+          },
+          timeout: 5000,
+        });
+
+        if (response.data?.status === 200 && response.data.data?.summary) {
+          binderbyteResult = response.data.data;
+          validCourier = courier;
+          console.log(`[REVALIDATE] ✅ Found as ${courier.toUpperCase()}`);
+          break;
+        }
+      } catch (err) {
+        console.log(`[REVALIDATE] ${courier}: ${err.message}`);
+        continue;
+      }
+    }
+
+    if (!validCourier) {
+      return res.status(404).json({
+        error: "Resi tidak ditemukan di sistem ekspedisi manapun",
+        resi: cleanResi
+      });
+    }
+
+    // Update tracking with validated data
+    tracking.courierType = validCourier;
+    tracking.validated = true;
+    tracking.validationAttempted = true;
+    tracking.note = `✅ Revalidated via ${validCourier.toUpperCase()}`;
+    tracking.binderbyteData = {
+      summary: binderbyteResult.summary,
+      validatedAt: new Date()
+    };
+    await tracking.save();
+
+    console.log(`[REVALIDATE] ✅ Updated ${cleanResi} as ${validCourier.toUpperCase()}`);
+
+    return res.json({
+      ok: true,
+      message: `Resi berhasil divalidasi ulang sebagai ${validCourier.toUpperCase()}`,
+      data: {
+        resi: cleanResi,
+        courierType: validCourier,
+        validated: true,
+        tracking: binderbyteResult.summary
+      }
+    });
+
+  } catch (err) {
+    console.error("POST /api/manual-resi/revalidate error:", err);
+    return res.status(500).json({ error: "Gagal revalidasi resi" });
   }
 });
 

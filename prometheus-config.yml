@@ -1,0 +1,16 @@
+# Prometheus Configuration for Smart Locker API
+# Add this job to your prometheus.yml file
+
+global:
+  scrape_interval: 15s # Scrape targets every 15 seconds
+  evaluation_interval: 15s # Evaluate rules every 15 seconds
+
+scrape_configs:
+  # Your Smart Locker API
+  - job_name: 'smart-locker-api'
+    static_configs:
+      - targets: ['host.docker.internal:3000']  # If Prometheus runs in Docker
+        # OR
+        # - targets: ['localhost:3000']  # If Prometheus runs directly on host
+    metrics_path: '/metrics'  # The endpoint Prometheus will scrape
+    scrape_interval: 10s  # Scrape every 10 seconds for thesis data collection

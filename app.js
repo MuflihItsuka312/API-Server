@@ -2681,11 +2681,12 @@ app.post("/api/locker/:lockerId/package-removed", async (req, res) => {
     }
 
     // If weight is low/zero, assume all packages were removed
-    const weightThreshold = 1; // grams - less than 1g means empty
+    // Now using kilograms, not grams
+    const weightThreshold = 1; // kilograms - less than 1kg means empty
     let removedCount = 0;
 
     if (weight < weightThreshold) {
-      console.log(`[LOADCELL] Weight below threshold (${weight}g < ${weightThreshold}g) - Removing all packages`);
+      console.log(`[LOADCELL] Weight below threshold (${weight}kg < ${weightThreshold}kg) - Removing all packages`);
       
       for (const shipment of shipments) {
         // Delete shipment

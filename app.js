@@ -1,9 +1,6 @@
 // server.js - Smart Locker Backend + Mongoose + Auth Customer
 // Implements One-Time Token System for Locker Access
 
-// IMPORTANT: Initialize OpenTelemetry FIRST (before any other modules)
-require('./tracing');
-
 require("dotenv").config();
 const crypto = require("crypto");
 const express = require("express");
@@ -184,6 +181,7 @@ const userSchema = new Schema(
     name: String,
     email: { type: String, unique: true, sparse: true },
     phone: String,
+    address: String, // Added for agent profile
     passwordHash: String,
     role: { type: String, default: "customer" }, // customer / agent / admin
     createdAt: { type: Date, default: Date.now },
@@ -210,6 +208,10 @@ const shipmentSchema = new Schema(
     courierId: { type: String },
     courierPlate: { type: String },
     courierName: { type: String },
+
+    // Weight tracking (in kilograms)
+    weight: { type: Number, default: null }, // Weight in kilograms from load cell sensor
+    weightRecordedAt: { type: Date, default: null }, // When weight was measured
 
     status: { type: String, default: "assigned_to_locker" },
     createdAt: { type: Date, default: Date.now },
@@ -244,6 +246,14 @@ const lockerSchema = new Schema(
   {
     lockerId: { type: String, required: true, unique: true },
     lockerToken: { type: String, default: null },
+
+    // Link to customer account
+    customerId: { type: String, default: null }, // userId from User collection
+
+    // Owner Information (from registration form)
+    ownerName: { type: String, default: null },
+    ownerAddress: { type: String, default: null },
+    ownerPhone: { type: String, default: null },
 
     // Track all couriers who delivered here
     courierHistory: {
@@ -324,6 +334,12 @@ const customerTrackingSchema = new Schema(
     // 🔥 NEW: Smart locker assignment
     assignedLockerId: { type: String },
     lockerAssignedAt: { type: Date },
+    // JNE specific: 5-digit customer number required for tracking
+    jneNumber: { type: String },
+    // Weight tracking (from customer input or ESP32)
+    weight: { type: Number, default: null }, // Weight in kilograms
+    weightRecordedAt: { type: Date, default: null }, // When weight was recorded
+    weightSource: { type: String, enum: ['customer', 'esp32', 'courier'], default: null }, // Who provided weight
   },
   {
     collection: "customer_trackings",
@@ -529,55 +545,47 @@ function sanitizeResi(resi) {
 }
 
 /**
- * Validate resi format and detect courier type
+ * Detect courier type from resi format (for smart priority ordering)
+ * Note: This is for PRIORITIZATION ONLY, not rejection.
+ * Unknown formats will still be validated via Binderbyte API.
  */
-function validateResi(resi) {
+function detectCourierType(resi) {
   if (!resi || resi.length < 8) {
-    return {
-      valid: false,
-      reason: 'Nomor resi terlalu pendek (minimal 8 karakter)'
-    };
+    return { detected: false, courierType: null };
   }
 
-  // JNE: starts with JNE or CGK, 10-15 chars
+  // JNE: starts with JNE or CGK, 10-15 alphanumeric chars
   if (/^(JNE|CGK)[A-Z0-9]{7,12}$/i.test(resi)) {
-    return { valid: true, courierType: 'jne' };
+    return { detected: true, courierType: 'jne' };
   }
 
-  // J&T: starts with JT, 12-16 digits
-  if (/^JT\d{10,14}$/i.test(resi)) {
-    return { valid: true, courierType: 'jnt' };
+  // J&T: starts with JT or JX, followed by digits
+  if (/^(JT|JX)\d{10,14}$/i.test(resi)) {
+    return { detected: true, courierType: 'jnt' };
   }
 
-  // AnterAja: 10-15 alphanumeric
-  if (/^[A-Z0-9]{10,15}$/i.test(resi) && resi.length >= 10) {
-    return { valid: true, courierType: 'anteraja' };
+  // AnterAja: starts with TSA or 10-15 alphanumeric
+  if (/^TSA[A-Z0-9]{7,12}$/i.test(resi) || (/^[A-Z0-9]{10,15}$/i.test(resi) && resi.length >= 10)) {
+    return { detected: true, courierType: 'anteraja' };
   }
 
-  // SiCepat: typically 12 digits
+  // SiCepat: exactly 12 digits
   if (/^\d{12}$/i.test(resi)) {
-    return { valid: true, courierType: 'sicepat' };
+    return { detected: true, courierType: 'sicepat' };
   }
 
-  // Ninja Express: starts with NLIDAP or numeric
+  // Ninja Express: starts with NLIDAP or NV, followed by digits
   if (/^(NLIDAP|NV)\d{8,12}$/i.test(resi)) {
-    return { valid: true, courierType: 'ninja' };
+    return { detected: true, courierType: 'ninja' };
   }
 
-  // POS Indonesia: various formats
-  if (/^[A-Z]{2}\d{9}ID$/i.test(resi) || /^\d{13}$/i.test(resi)) {
-    return { valid: true, courierType: 'pos' };
+  // POS Indonesia: RR...ID format or 13 digits
+  if (/^RR\d{9}ID$/i.test(resi) || /^\d{13}$/i.test(resi)) {
+    return { detected: true, courierType: 'pos' };
   }
 
-  // Default: try JNE if alphanumeric
-  if (/^[A-Z0-9]{10,}$/i.test(resi)) {
-    return { valid: true, courierType: 'jne' };
-  }
-
-  return {
-    valid: false,
-    reason: 'Format resi tidak dikenali. Pastikan nomor resi benar.'
-  };
+  // Unknown format - will try all couriers
+  return { detected: false, courierType: null };
 }
 
 // ==================================================
@@ -672,7 +680,7 @@ app.get("/", (req, res) => {
 // Register customer
 app.post("/api/auth/register", async (req, res) => {
   try {
-    const { name, email, phone, password } = req.body;
+    const { name, email, phone, address, password } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({ error: "Email dan password wajib diisi" });
@@ -690,6 +698,7 @@ app.post("/api/auth/register", async (req, res) => {
       name,
       email,
       phone,
+      address, // ✅ Now saving address
       passwordHash: hash,
       role: "customer",
     });
@@ -811,6 +820,8 @@ app.post("/api/shipments", async (req, res) => {
           ? courier.plate
           : "",
         courierName: courierName || "",
+        weight: null, // Will be set when courier deposits package (in kg)
+        weightRecordedAt: null,
         status: "pending_locker",
         createdAt: new Date(),
         logs: [
@@ -934,7 +945,7 @@ app.get("/api/validate-resi", async (req, res) => {
 // ==================== CUSTOMER: Input Resi Manual (CACHED VALIDATION) ====================
 app.post("/api/customer/manual-resi", auth, async (req, res) => {
   try {
-    const { resi } = req.body;
+    const { resi, jneNumber } = req.body;
     const userId = req.user.userId;
 
     if (!resi || !resi.trim()) {
@@ -942,7 +953,7 @@ app.post("/api/customer/manual-resi", auth, async (req, res) => {
     }
 
     const cleanResi = resi.trim().toUpperCase();
-    console.log(`[RESI INPUT] Customer ${userId}: "${cleanResi}"`);
+    console.log(`[RESI INPUT] Customer ${userId}: "${cleanResi}"${jneNumber ? ` + JNE#${jneNumber}` : ''}`);
 
     // ✅ STEP 1: CHECK IF THIS USER ALREADY HAS THIS RESI
     const existing = await CustomerTracking.findOne({
@@ -978,20 +989,23 @@ app.post("/api/customer/manual-resi", auth, async (req, res) => {
         binderbyteData: cachedResi.binderbyteData || null
       });
 
-      // 🔥 Auto-assign locker for cached resi too
+      // 🔥 Auto-assign locker for cached resi too (only customer's own lockers)
       let assignedLockerId = null;
       try {
         const availableLocker = await Locker.findOne({
+          customerId: userId, // Only customer's own lockers
           status: 'online',
           isActive: true
-        }).sort({ 'pendingResi.length': 1 });
+        }).sort({ 'pendingResi.length': 1 }); // Least busy locker first
 
         if (availableLocker) {
           assignedLockerId = availableLocker.lockerId;
           tracking.assignedLockerId = assignedLockerId;
           tracking.lockerAssignedAt = new Date();
           await tracking.save();
-          console.log(`[LOCKER ASSIGNED] ${assignedLockerId} auto-assigned to cached ${cleanResi}`);
+          console.log(`[LOCKER ASSIGNED] ${assignedLockerId} auto-assigned to cached ${cleanResi} (customer: ${userId})`);
+        } else {
+          console.log(`[LOCKER ASSIGN] No online locker available for customer ${userId}`);
         }
       } catch (assignErr) {
         console.error('[LOCKER ASSIGN] Failed:', assignErr.message);
@@ -1014,7 +1028,7 @@ app.post("/api/customer/manual-resi", auth, async (req, res) => {
       });
     }
 
-    // ✅ STEP 3: CHECK BINDERBYTE API KEY
+    // ✅ STEP 3: Let binderbyte handle ALL courier detection (removed regex patterns)
     if (!BINDER_KEY) {
       console.error('[RESI ERROR] BINDERBYTE_API_KEY not configured!');
       return res.status(503).json({
@@ -1023,23 +1037,10 @@ app.post("/api/customer/manual-resi", auth, async (req, res) => {
       });
     }
 
-    // ✅ STEP 4: SMART COURIER DETECTION (reduce brute force)
-    let courierPriority = [];
-    
-    // Pattern-based detection for faster validation
-    if (/^JT\d{10,}/i.test(cleanResi)) {
-      courierPriority = ['jnt', 'jne', 'anteraja', 'sicepat', 'ninja', 'pos'];
-    } else if (/^(JNE|CGK)/i.test(cleanResi)) {
-      courierPriority = ['jne', 'jnt', 'anteraja', 'sicepat', 'ninja', 'pos'];
-    } else if (/^\d{14}$/.test(cleanResi)) {
-      courierPriority = ['anteraja', 'sicepat', 'jnt', 'jne', 'ninja', 'pos'];
-    } else if (/^NLIDAP|^NV/i.test(cleanResi)) {
-      courierPriority = ['ninja', 'jne', 'jnt', 'anteraja', 'sicepat', 'pos'];
-    } else {
-      courierPriority = ['jne', 'jnt', 'anteraja', 'sicepat', 'ninja', 'pos'];
-    }
+    // ✅ STEP 4: Try all major couriers (let binderbyte API decide)
+    const courierPriority = ['jne', 'jnt', 'sicepat', 'anteraja', 'ninja', 'pos', 'tiki', 'wahana', 'lion', 'rpx'];
 
-    console.log(`[BINDERBYTE] Validating ${cleanResi} - smart order: ${courierPriority.join(', ')}...`);
+    console.log(`[BINDERBYTE] Validating ${cleanResi} - trying all couriers...`);
 
     const validationStart = Date.now();
     let binderbyteResult = null;
@@ -1051,12 +1052,25 @@ app.post("/api/customer/manual-resi", auth, async (req, res) => {
         console.log(`[BINDERBYTE] Trying ${courier}...`);
         const apiStartTime = Date.now();
 
+        // Build API params
+        const apiParams = {
+          api_key: BINDER_KEY,
+          courier: courier,
+          awb: cleanResi,
+        };
+        
+        // JNE requires additional 5-digit number parameter
+        if (courier === 'jne') {
+          if (!jneNumber || !/^\d{5}$/.test(jneNumber.trim())) {
+            console.log(`[BINDERBYTE] Skipping JNE - invalid/missing 5-digit number`);
+            continue; // Skip JNE if number not provided or invalid
+          }
+          apiParams.number = jneNumber.trim();
+          console.log(`[BINDERBYTE] JNE tracking with number: ${jneNumber}`);
+        }
+
         const response = await axios.get("https://api.binderbyte.com/v1/track", {
-          params: {
-            api_key: BINDER_KEY,
-            courier: courier,
-            awb: cleanResi,
-          },
+          params: apiParams,
           timeout: 5000, // Reduced to 5s per courier
         });
 
@@ -1088,10 +1102,60 @@ app.post("/api/customer/manual-resi", auth, async (req, res) => {
 
     const totalTime = Date.now() - validationStart;
 
-    // ✅ STEP 6: IF NOT FOUND IN ANY COURIER, REJECT
+    // ✅ STEP 6: IF NOT FOUND IN BINDERBYTE
     if (!binderbyteResult || !validCourier) {
-      console.error(`[BINDERBYTE] ❌ REJECTED: ${cleanResi} - not found in any courier (${totalTime}ms)`);
+      console.error(`[BINDERBYTE] ❌ NOT FOUND: ${cleanResi} - not found in Binderbyte (${totalTime}ms)`);
 
+      // 🔥 NEW: If we have HIGH CONFIDENCE pattern match, TRUST IT even if Binderbyte fails
+      // This handles cases where:
+      // - Binderbyte has incomplete courier data
+      // - Resi is too new or too old for Binderbyte cache
+      // - API integration delays
+      if (highConfidence && courierPriority.length === 1) {
+        const detectedCourier = courierPriority[0];
+        console.log(`[BINDERBYTE] ✅ ACCEPTING HIGH CONFIDENCE match: ${detectedCourier.toUpperCase()} (Binderbyte unavailable)`);
+        
+        // Save to database with limited info (no Binderbyte tracking data)
+        const tracking = await CustomerTracking.create({
+          resi: cleanResi,
+          courierType: detectedCourier,
+          customerId: userId,
+          note: `✅ Pattern-validated (Binderbyte unavailable)`,
+          validated: true,
+          validationAttempted: true,
+          binderbyteData: {
+            summary: {
+              courier: detectedCourier,
+              status: 'unknown',
+              waybill: cleanResi
+            },
+            validatedAt: new Date(),
+            note: 'Courier detected by HIGH CONFIDENCE pattern. External API unavailable.'
+          }
+        });
+
+        return res.json({
+          success: true,
+          resi: cleanResi,
+          courierType: detectedCourier,
+          tracking: {
+            _id: tracking._id,
+            note: tracking.note,
+            status: 'unknown',
+            history: [],
+            summary: {
+              courier: detectedCourier,
+              status: 'Nomor resi valid, tracking detail belum tersedia',
+              waybill: cleanResi
+            }
+          },
+          message: `✅ Nomor resi valid (${detectedCourier.toUpperCase()}). Detail tracking akan tersedia setelah paket di-pickup.`,
+          validationMethod: 'HIGH_CONFIDENCE_PATTERN',
+          warning: 'Detail tracking belum tersedia dari sistem ekspedisi'
+        });
+      }
+
+      // No high confidence pattern - reject
       return res.status(404).json({
         error: "Nomor resi tidak ditemukan",
         resi: cleanResi,
@@ -1100,8 +1164,8 @@ app.post("/api/customer/manual-resi", auth, async (req, res) => {
       });
     }
 
-    // ✅ STEP 7: SAVE TO DATABASE (only valid resi)
-    const tracking = await CustomerTracking.create({
+    // ✅ STEP 7: SAVE TO DATABASE (only valid resi - this creates cache for future queries)
+    const trackingData = {
       resi: cleanResi,
       courierType: validCourier,
       customerId: userId,
@@ -1112,11 +1176,18 @@ app.post("/api/customer/manual-resi", auth, async (req, res) => {
         summary: binderbyteResult.summary,
         validatedAt: new Date()
       }
-    });
+    };
+    
+    // Save JNE number if JNE courier
+    if (validCourier === 'jne' && jneNumber) {
+      trackingData.jneNumber = jneNumber.trim();
+    }
+    
+    const tracking = await CustomerTracking.create(trackingData);
 
     console.log(`[RESI SAVED] ✅ ${cleanResi} for customer ${userId} via ${validCourier.toUpperCase()}`);
 
-    // ✅ STEP 6: SEND NOTIFICATION
+    // ✅ STEP 8: SEND NOTIFICATION
     try {
       await sendNotificationToCustomer(
         userId,
@@ -1133,28 +1204,29 @@ app.post("/api/customer/manual-resi", auth, async (req, res) => {
       console.error('[NOTIFICATION] Failed:', notifErr.message);
     }
 
-    // 🔥 NEW: Auto-assign available online locker
+    // 🔥 NEW: Auto-assign available online locker (only customer's own lockers)
     let assignedLockerId = null;
     try {
       const availableLocker = await Locker.findOne({
+        customerId: userId, // Only customer's own lockers
         status: 'online',
         isActive: true
-      }).sort({ 'pendingResi.length': 1 }); // Least busy locker
+      }).sort({ 'pendingResi.length': 1 }); // Least busy locker first
 
       if (availableLocker) {
         assignedLockerId = availableLocker.lockerId;
         tracking.assignedLockerId = assignedLockerId;
         tracking.lockerAssignedAt = new Date();
         await tracking.save();
-        console.log(`[LOCKER ASSIGNED] ${assignedLockerId} auto-assigned to ${cleanResi}`);
+        console.log(`[LOCKER ASSIGNED] ${assignedLockerId} auto-assigned to ${cleanResi} (customer: ${userId})`);
       } else {
-        console.log(`[LOCKER ASSIGN] No online locker available for ${cleanResi}`);
+        console.log(`[LOCKER ASSIGN] No online locker available for customer ${userId}`);
       }
     } catch (assignErr) {
       console.error('[LOCKER ASSIGN] Failed:', assignErr.message);
     }
 
-    // ✅ STEP 7: RETURN SUCCESS WITH TRACKING DATA
+    // ✅ STEP 9: RETURN SUCCESS WITH TRACKING DATA
     return res.json({
       ok: true,
       message: `Resi berhasil divalidasi via ${validCourier.toUpperCase()}`,
@@ -1234,6 +1306,7 @@ app.get("/api/manual-resi", async (req, res) => {
 app.post("/api/manual-resi/revalidate/:resi", async (req, res) => {
   try {
     const { resi } = req.params;
+    const { jneNumber } = req.body; // Get JNE number from request body
     const cleanResi = resi.trim().toUpperCase();
 
     console.log(`[RESI REVALIDATE] Attempting to revalidate ${cleanResi}...`);
@@ -1265,12 +1338,26 @@ app.post("/api/manual-resi/revalidate/:resi", async (req, res) => {
     for (const courier of courierPriority) {
       try {
         console.log(`[REVALIDATE] Trying ${courier}...`);
+        
+        // Build API params
+        const apiParams = {
+          api_key: BINDER_KEY,
+          courier: courier,
+          awb: cleanResi,
+        };
+        
+        // JNE requires additional 5-digit number parameter
+        if (courier === 'jne') {
+          if (!jneNumber || !/^\d{5}$/.test(jneNumber.trim())) {
+            console.log(`[REVALIDATE] Skipping JNE - invalid/missing 5-digit number`);
+            continue;
+          }
+          apiParams.number = jneNumber.trim();
+          console.log(`[REVALIDATE] JNE tracking with number: ${jneNumber}`);
+        }
+        
         const response = await axios.get("https://api.binderbyte.com/v1/track", {
-          params: {
-            api_key: BINDER_KEY,
-            courier: courier,
-            awb: cleanResi,
-          },
+          params: apiParams,
           timeout: 5000,
         });
 
@@ -1302,6 +1389,12 @@ app.post("/api/manual-resi/revalidate/:resi", async (req, res) => {
       summary: binderbyteResult.summary,
       validatedAt: new Date()
     };
+    
+    // Save JNE number if JNE courier
+    if (validCourier === 'jne' && jneNumber) {
+      tracking.jneNumber = jneNumber.trim();
+    }
+    
     await tracking.save();
 
     console.log(`[REVALIDATE] ✅ Updated ${cleanResi} as ${validCourier.toUpperCase()}`);
@@ -1320,6 +1413,69 @@ app.post("/api/manual-resi/revalidate/:resi", async (req, res) => {
   } catch (err) {
     console.error("POST /api/manual-resi/revalidate error:", err);
     return res.status(500).json({ error: "Gagal revalidasi resi" });
+  }
+});
+
+// Update weight for manual resi (Agent/Customer endpoint)
+app.put("/api/manual-resi/:resi/weight", async (req, res) => {
+  try {
+    const { resi } = req.params;
+    const { weight, weightSource } = req.body;
+    const cleanResi = resi.trim().toUpperCase();
+
+    // Validate weight
+    const weightValue = parseFloat(weight);
+    if (isNaN(weightValue) || weightValue < 0 || weightValue > 100) {
+      return res.status(400).json({ 
+        ok: false,
+        error: "Weight harus antara 0-100 kg" 
+      });
+    }
+
+    // Validate source
+    const validSources = ['customer', 'esp32', 'courier'];
+    if (weightSource && !validSources.includes(weightSource)) {
+      return res.status(400).json({ 
+        ok: false,
+        error: `weightSource harus salah satu dari: ${validSources.join(', ')}` 
+      });
+    }
+
+    console.log(`[WEIGHT UPDATE] ${cleanResi}: ${weightValue}kg from ${weightSource || 'unknown'}`);
+
+    const tracking = await CustomerTracking.findOne({ resi: cleanResi });
+    if (!tracking) {
+      return res.status(404).json({ 
+        ok: false,
+        error: "Resi tidak ditemukan di database" 
+      });
+    }
+
+    // Update weight
+    tracking.weight = weightValue;
+    tracking.weightRecordedAt = new Date();
+    tracking.weightSource = weightSource || 'customer';
+    await tracking.save();
+
+    console.log(`[WEIGHT UPDATE] ✅ ${cleanResi} weight updated to ${weightValue}kg`);
+
+    return res.json({
+      ok: true,
+      message: "Berat berhasil diupdate",
+      data: {
+        resi: cleanResi,
+        weight: weightValue,
+        weightSource: tracking.weightSource,
+        weightRecordedAt: tracking.weightRecordedAt
+      }
+    });
+
+  } catch (err) {
+    console.error("PUT /api/manual-resi/:resi/weight error:", err);
+    return res.status(500).json({ 
+      ok: false,
+      error: "Gagal update berat" 
+    });
   }
 });
 
@@ -1382,10 +1538,13 @@ app.get("/api/agent/active-resi", async (req, res) => {
       if (isActive) {
         const customer = await User.findOne({ userId: tracking.customerId });
         
-        // Get/assign locker
+        // Get/assign locker (only customer's own lockers)
         let assignedLockerId = tracking.assignedLockerId;
+        let lockerInfo = null;
+        
         if (!assignedLockerId) {
           const availableLocker = await Locker.findOne({
+            customerId: tracking.customerId, // Only that customer's own lockers
             status: 'online',
             isActive: true
           }).sort({ 'pendingResi.length': 1 });
@@ -1395,8 +1554,12 @@ app.get("/api/agent/active-resi", async (req, res) => {
             tracking.assignedLockerId = assignedLockerId;
             tracking.lockerAssignedAt = new Date();
             await tracking.save();
-            console.log(`[AUTO-ASSIGN] ${assignedLockerId} → ${tracking.resi}`);
+            lockerInfo = availableLocker;
+            console.log(`[AUTO-ASSIGN] ${assignedLockerId} → ${tracking.resi} (customer: ${tracking.customerId})`);
           }
+        } else {
+          // Fetch locker info if already assigned
+          lockerInfo = await Locker.findOne({ lockerId: assignedLockerId });
         }
         
         activeResi.push({
@@ -1407,6 +1570,10 @@ app.get("/api/agent/active-resi", async (req, res) => {
           customerPhone: customer?.phone || '',
           assignedLockerId: assignedLockerId,
           lockerAssignedAt: tracking.lockerAssignedAt,
+          // Add locker owner information for agent
+          lockerOwnerName: lockerInfo?.ownerName || '',
+          lockerOwnerAddress: lockerInfo?.ownerAddress || '',
+          lockerOwnerPhone: lockerInfo?.ownerPhone || '',
           currentStatus: shipment?.status || 'not_assigned',
           validatedAt: tracking.createdAt,
           displayLabel: `${tracking.resi} - ${tracking.courierType.toUpperCase()} - ${customer?.name || 'Unknown'}${assignedLockerId ? ` - ${assignedLockerId}` : ''}`
@@ -1425,19 +1592,341 @@ app.get("/api/agent/active-resi", async (req, res) => {
   }
 });
 
-// List semua shipment milik customer (pakai JWT)
+// 🔥 NEW: Agent update profile (name and address)
+app.post("/api/agent/profile", auth, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { name, address, phone } = req.body;
+
+    // Validation
+    if (!name || !name.trim()) {
+      return res.status(400).json({
+        success: false,
+        error: "Nama wajib diisi"
+      });
+    }
+
+    if (!address || !address.trim()) {
+      return res.status(400).json({
+        success: false,
+        error: "Alamat wajib diisi"
+      });
+    }
+
+    // Find and update user
+    const user = await User.findOne({ userId });
+    
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: "User tidak ditemukan"
+      });
+    }
+
+    // Update profile
+    user.name = name.trim();
+    user.address = address.trim();
+    if (phone && phone.trim()) {
+      user.phone = phone.trim();
+    }
+    
+    await user.save();
+
+    console.log(`[AGENT PROFILE] Updated profile for agent ${userId}: ${name}`);
+
+    res.json({
+      success: true,
+      message: "Profile berhasil diperbarui",
+      data: {
+        userId: user.userId,
+        name: user.name,
+        address: user.address,
+        phone: user.phone,
+        role: user.role
+      }
+    });
+  } catch (err) {
+    console.error("POST /api/agent/profile error:", err);
+    res.status(500).json({
+      success: false,
+      error: "Gagal memperbarui profile"
+    });
+  }
+});
+
+// 🔥 NEW: Agent get profile
+app.get("/api/agent/profile", auth, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    const user = await User.findOne({ userId }).lean();
+    
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: "User tidak ditemukan"
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        userId: user.userId,
+        name: user.name,
+        address: user.address || '',
+        phone: user.phone || '',
+        email: user.email || '',
+        role: user.role,
+        createdAt: user.createdAt
+      }
+    });
+  } catch (err) {
+    console.error("GET /api/agent/profile error:", err);
+    res.status(500).json({
+      success: false,
+      error: "Gagal mengambil data profile"
+    });
+  }
+});
+
+// List semua shipment milik customer (pakai JWT) - Enhanced with weight info
 app.get("/api/customer/shipments", auth, async (req, res) => {
   try {
     const userId = req.user.userId;
 
     const shipments = await Shipment.find({ customerId: userId })
-      . sort({ createdAt: -1 })
+      .sort({ createdAt: -1 })
       .lean();
 
-    res.json({ data: shipments });
+    // Enrich each shipment with formatted data
+    const enrichedShipments = shipments.map(shipment => ({
+      ...shipment,
+      weightInfo: {
+        weight: shipment.weight,
+        weightKg: shipment.weight ? shipment.weight.toFixed(2) : null,
+        unit: "kg",
+        recorded: shipment.weight !== null && shipment.weight !== undefined,
+        recordedAt: shipment.weightRecordedAt
+      },
+      trackingAvailable: shipment.logs && shipment.logs.length > 0
+    }));
+
+    res.json({ data: enrichedShipments });
   } catch (err) {
     console.error("GET /api/customer/shipments error:", err);
-    res. status(500).json({ error: "Gagal mengambil data shipments" });
+    res.status(500).json({ error: "Gagal mengambil data shipments" });
+  }
+});
+
+// Get single shipment by resi (for detail view with tracking)
+app.get("/api/customer/shipments/:resi", auth, async (req, res) => {
+  try {
+    const { resi } = req.params;
+    const userId = req.user.userId;
+    const cleanResi = resi.trim().toUpperCase();
+
+    console.log(`[SHIPMENT DETAIL] Customer ${userId} requesting ${cleanResi}`);
+
+    const shipment = await Shipment.findOne({ 
+      resi: cleanResi,
+      customerId: userId 
+    }).lean();
+
+    if (!shipment) {
+      return res.status(404).json({
+        ok: false,
+        error: "Shipment tidak ditemukan atau bukan milik Anda"
+      });
+    }
+
+    // Format tracking history from logs
+    const trackingHistory = shipment.logs ? shipment.logs.map(log => ({
+      event: log.event,
+      timestamp: log.timestamp,
+      description: formatEventDescription(log.event, log.extra),
+      details: log.extra
+    })).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)) : [];
+
+    // Get locker info
+    const locker = await Locker.findOne({ lockerId: shipment.lockerId }).lean();
+
+    return res.json({
+      ok: true,
+      data: {
+        resi: shipment.resi,
+        courierType: shipment.courierType,
+        lockerId: shipment.lockerId,
+        lockerInfo: locker ? {
+          lockerId: locker.lockerId,
+          ownerName: locker.ownerName,
+          ownerAddress: locker.ownerAddress,
+          status: locker.status
+        } : null,
+        status: shipment.status,
+        statusLabel: formatStatusLabel(shipment.status),
+        weight: {
+          value: shipment.weight,
+          formatted: shipment.weight ? `${shipment.weight.toFixed(2)} kg` : "Belum tercatat",
+          recorded: shipment.weight !== null && shipment.weight !== undefined,
+          recordedAt: shipment.weightRecordedAt
+        },
+        tracking: {
+          available: trackingHistory.length > 0,
+          history: trackingHistory,
+          count: trackingHistory.length
+        },
+        dates: {
+          created: shipment.createdAt,
+          deliveredToLocker: shipment.deliveredToLockerAt,
+          deliveredToCustomer: shipment.deliveredToCustomerAt,
+          pickedUp: shipment.pickedUpAt
+        },
+        receiver: {
+          name: shipment.receiverName,
+          phone: shipment.receiverPhone
+        },
+        courier: {
+          name: shipment.courierName,
+          plate: shipment.courierPlate,
+          type: shipment.courierType
+        }
+      }
+    });
+
+  } catch (err) {
+    console.error("GET /api/customer/shipments/:resi error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Gagal mengambil detail shipment"
+    });
+  }
+});
+
+// Helper function to format event descriptions
+function formatEventDescription(event, extra) {
+  const descriptions = {
+    'assigned_to_locker': 'Paket ditugaskan ke locker',
+    'courier_scanned': 'Kurir scan QR code',
+    'locker_opened': 'Locker dibuka',
+    'delivered_to_locker': 'Paket diterima di locker',
+    'weight_recorded': 'Berat paket tercatat',
+    'weight_recorded_differential': 'Berat paket tercatat (sensor)',
+    'customer_opened': 'Customer buka locker',
+    'delivered_to_customer': 'Paket diambil customer',
+    'completed': 'Pengiriman selesai'
+  };
+
+  let desc = descriptions[event] || event;
+  
+  // Add extra details if available
+  if (extra) {
+    if (extra.weight) {
+      desc += ` (${extra.weight} kg)`;
+    }
+    if (extra.packageWeight) {
+      desc += ` (${extra.packageWeight} kg)`;
+    }
+  }
+
+  return desc;
+}
+
+// Helper function to format status labels
+function formatStatusLabel(status) {
+  const labels = {
+    'pending_locker': 'Menunggu kurir',
+    'assigned_to_locker': 'Ditugaskan ke locker',
+    'delivered_to_locker': 'Di locker',
+    'ready_for_pickup': 'Siap diambil',
+    'delivered_to_customer': 'Sudah diambil',
+    'completed': 'Selesai'
+  };
+
+  return labels[status] || status;
+}
+
+// 🔥 NEW: Customer update profile (name, phone, address)
+app.post("/api/customer/profile", auth, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { name, phone, address } = req.body;
+
+    const user = await User.findOne({ userId });
+    
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: "User tidak ditemukan"
+      });
+    }
+
+    // Update profile fields
+    if (name && name.trim()) {
+      user.name = name.trim();
+    }
+    if (phone && phone.trim()) {
+      user.phone = phone.trim();
+    }
+    if (address && address.trim()) {
+      user.address = address.trim();
+    }
+    
+    await user.save();
+
+    console.log(`[CUSTOMER PROFILE] Updated profile for customer ${userId}`);
+
+    res.json({
+      success: true,
+      message: "Profile berhasil diperbarui",
+      data: {
+        userId: user.userId,
+        name: user.name,
+        phone: user.phone,
+        address: user.address,
+        email: user.email
+      }
+    });
+  } catch (err) {
+    console.error("POST /api/customer/profile error:", err);
+    res.status(500).json({
+      success: false,
+      error: "Gagal memperbarui profile"
+    });
+  }
+});
+
+// 🔥 NEW: Customer get profile
+app.get("/api/customer/profile", auth, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    const user = await User.findOne({ userId }).lean();
+    
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: "User tidak ditemukan"
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        userId: user.userId,
+        name: user.name,
+        phone: user.phone || '',
+        address: user.address || '',
+        email: user.email || '',
+        role: user.role,
+        createdAt: user.createdAt
+      }
+    });
+  } catch (err) {
+    console.error("GET /api/customer/profile error:", err);
+    res.status(500).json({
+      success: false,
+      error: "Gagal mengambil data profile"
+    });
   }
 });
 
@@ -1570,12 +2059,24 @@ app.get("/api/customer/track/:resi", async (req, res) => {
     try {
       console.log(`[TRACKING] Fetching ${resi} from Binderbyte (${courierType})...`);
 
+      // Build API params
+      const apiParams = {
+        api_key: BINDER_KEY,
+        courier: courierType,
+        awb: resi,
+      };
+      
+      // JNE requires additional 5-digit number parameter
+      if (courierType === 'jne' && tracking?.jneNumber) {
+        apiParams.number = tracking.jneNumber;
+        console.log(`[TRACKING] JNE tracking with number: ${tracking.jneNumber}`);
+      } else if (courierType === 'jne' && req.query.jneNumber) {
+        apiParams.number = req.query.jneNumber;
+        console.log(`[TRACKING] JNE tracking with number from query: ${req.query.jneNumber}`);
+      }
+
       const bbResp = await axios.get("https://api.binderbyte.com/v1/track", {
-        params: {
-          api_key: BINDER_KEY,
-          courier: courierType,
-          awb: resi,
-        },
+        params: apiParams,
         timeout: 15000, // Reduced to 15 seconds for faster mobile response
       });
 
@@ -2062,13 +2563,14 @@ app.post("/api/courier/deposit-token", async (req, res) => {
   const requestId = `SCAN-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
   
   try {
-    const { lockerId, lockerToken, resi } = req.body;
+    const { lockerId, lockerToken, resi, weight } = req.body; // Added weight parameter
 
     console.log(`\n========================================`);
     console.log(`[🔍 COURIER SCAN START] RequestID: ${requestId}`);
     console.log(`[📥 REQUEST] Time: ${new Date().toISOString()}`);
     console.log(`[📥 REQUEST] LockerId: ${lockerId}`);
     console.log(`[📥 REQUEST] Resi: ${resi}`);
+    console.log(`[📥 REQUEST] Weight: ${weight ? `${weight} kg` : 'NOT PROVIDED ⚠️'}`);
     console.log(`[📥 REQUEST] Token: ${lockerToken?.substring(0, 15)}...`);
     console.log(`========================================\n`);
 
@@ -2190,6 +2692,15 @@ app.post("/api/courier/deposit-token", async (req, res) => {
 
     console.log(`[💾 UPDATING] Shipment status & locker command...`);
 
+    // 📊 STORE WEIGHT DATA IF PROVIDED
+    if (weight && !isNaN(weight) && weight > 0) {
+      shipment.weight = parseFloat(weight.toFixed(3)); // Store weight in kg (3 decimals)
+      shipment.weightRecordedAt = new Date();
+      console.log(`[⚖️  WEIGHT RECORDED] ${weight}kg for resi ${resi}`);
+    } else {
+      console.log(`[⚠️  NO WEIGHT] Weight not provided or invalid: ${weight}`);
+    }
+
     shipment.status = "delivered_to_locker";
     shipment.deliveredToLockerAt = new Date();
     shipment.logs.push({
@@ -2197,7 +2708,11 @@ app.post("/api/courier/deposit-token", async (req, res) => {
       lockerId,
       resi,
       timestamp: new Date(),
-      extra: { source: "courier_deposit_token", requestId },
+      extra: { 
+        source: "courier_deposit_token", 
+        requestId,
+        weight: weight || null // Include weight in logs
+      },
     });
     await shipment.save();
 
@@ -2251,6 +2766,7 @@ app.post("/api/courier/deposit-token", async (req, res) => {
     console.log(`[✅ DEPOSIT SUCCESS] ${requestId}`);
     console.log(`[⏱️  RESPONSE TIME] ${successTime}ms (Status: 200)`);
     console.log(`[📦 RESULT] Resi: ${resi} → Locker: ${lockerId}`);
+    console.log(`[⚖️  WEIGHT] ${shipment.weight ? `${shipment.weight}g` : 'Not recorded'}`);
     console.log(`[🔑 NEW TOKEN] ${locker.lockerToken?.substring(0, 15)}...`);
     console.log(`========================================\n`);
 
@@ -2263,6 +2779,8 @@ app.post("/api/courier/deposit-token", async (req, res) => {
         lockerId,
         resi,
         customerId: shipment.customerId || "",
+        weight: shipment.weight || null, // Include weight in response
+        weightRecordedAt: shipment.weightRecordedAt || null,
         oldToken, // For debugging
         newToken: locker.lockerToken,
       },
@@ -2430,19 +2948,41 @@ app.get("/api/courier/tasks", async (req, res) => {
       filter.courierId = courierId;
     }
 
-    const shipments = await Shipment.find(filter). lean();
+    const shipments = await Shipment.find(filter).lean();
+
+    // 🔥 Enrich with customer info (phone number, name, locker address)
+    const enrichedData = await Promise.all(
+      shipments.map(async (s) => {
+        // Get customer info
+        const customer = await User.findOne({ userId: s.customerId }).lean();
+        
+        // Get locker info (for owner address)
+        const locker = await Locker.findOne({ lockerId: s.lockerId }).lean();
+        
+        return {
+          shipmentId: s._id,
+          resi: s.resi,
+          lockerId: s.lockerId,
+          courierType: s.courierType,
+          courierPlate: s.courierPlate,
+          customerId: s.customerId,
+          // ✅ Add customer info for courier
+          customerName: customer?.name || '',
+          customerPhone: customer?.phone || '',
+          // ✅ Add locker owner info for delivery address
+          lockerOwnerName: locker?.ownerName || '',
+          lockerOwnerAddress: locker?.ownerAddress || '',
+          lockerOwnerPhone: locker?.ownerPhone || '',
+          status: s.status,
+          createdAt: s.createdAt,
+        };
+      })
+    );
 
     return res.json({
       ok: true,
-      data: shipments. map((s) => ({
-        shipmentId: s._id,
-        resi: s.resi,
-        lockerId: s.lockerId,
-        courierType: s.courierType,
-        courierPlate: s. courierPlate,
-        customerId: s.customerId,
-        status: s.status,
-      })),
+      count: enrichedData.length,
+      data: enrichedData,
     });
   } catch (err) {
     console.error("GET /api/courier/tasks error:", err);
@@ -2778,6 +3318,122 @@ app.post("/api/scan", async (req, res) => {
 
 // ---------------------- LOCKER LIST / POOL ----------------------
 
+// POST: Register a new locker client (form submission) - Requires Auth
+app.post("/api/lockers/register", auth, async (req, res) => {
+  try {
+    const { lockerId, nama, alamat, phoneNumber } = req.body;
+    const customerId = req.user.userId; // From JWT token
+
+    // Validation
+    if (!lockerId || !nama || !alamat || !phoneNumber) {
+      return res.status(400).json({
+        success: false,
+        error: "Semua field wajib diisi (lockerId, nama, alamat, phoneNumber)"
+      });
+    }
+
+    // Check if locker ID already exists
+    const existingLocker = await Locker.findOne({ lockerId });
+    if (existingLocker) {
+      return res.status(409).json({
+        success: false,
+        error: `Locker dengan ID '${lockerId}' sudah terdaftar`
+      });
+    }
+
+    // Generate token for the new locker
+    const lockerToken = randomToken(`LK-${lockerId}`);
+
+    // Create new locker linked to customer account
+    const newLocker = await Locker.create({
+      lockerId,
+      lockerToken,
+      customerId, // Link to customer account
+      ownerName: nama,
+      ownerAddress: alamat,
+      ownerPhone: phoneNumber,
+      pendingResi: [],
+      courierHistory: [],
+      command: null,
+      isActive: true,
+      status: "unknown",
+      tokenUpdatedAt: new Date(),
+    });
+
+    console.log(`[REGISTER] New locker registered: ${lockerId} - Owner: ${nama} - Customer: ${customerId}`);
+
+    res.status(201).json({
+      success: true,
+      message: "Locker berhasil didaftarkan ke akun Anda",
+      data: {
+        lockerId: newLocker.lockerId,
+        lockerToken: newLocker.lockerToken,
+        customerId: newLocker.customerId,
+        ownerName: newLocker.ownerName,
+        ownerAddress: newLocker.ownerAddress,
+        ownerPhone: newLocker.ownerPhone,
+        status: newLocker.status,
+        createdAt: newLocker.tokenUpdatedAt
+      }
+    });
+  } catch (err) {
+    console.error("POST /api/lockers/register error:", err);
+    
+    // Handle duplicate key error
+    if (err.code === 11000) {
+      return res.status(409).json({
+        success: false,
+        error: "Locker ID sudah terdaftar"
+      });
+    }
+    
+    res.status(500).json({
+      success: false,
+      error: "Gagal mendaftarkan locker"
+    });
+  }
+});
+
+// GET: Get all lockers belonging to the logged-in customer
+app.get("/api/customer/lockers", auth, async (req, res) => {
+  try {
+    const customerId = req.user.userId;
+    
+    const lockers = await Locker.find({ customerId });
+    console.log(`[DEBUG] GET /api/customer/lockers - Found ${lockers.length} lockers for customer ${customerId}`);
+
+    // Calculate status for each locker
+    const now = new Date();
+    const updatedLockers = lockers.map(locker => {
+      let status = "unknown";
+      if (locker.lastHeartbeat) {
+        const diff = now - new Date(locker.lastHeartbeat);
+        if (diff < 2 * 60 * 1000) {
+          status = "online";
+        } else {
+          status = "offline";
+        }
+      }
+      return {
+        ...locker.toObject(),
+        status,
+      };
+    });
+
+    res.json({
+      success: true,
+      count: updatedLockers.length,
+      lockers: updatedLockers
+    });
+  } catch (err) {
+    console.error("GET /api/customer/lockers error:", err);
+    res.status(500).json({ 
+      success: false,
+      error: "Gagal mengambil data locker" 
+    });
+  }
+});
+
 // GET semua locker (untuk Agent Locker Client Pool)
 app.get("/api/lockers", async (req, res) => {
   try {
@@ -2786,7 +3442,7 @@ app.get("/api/lockers", async (req, res) => {
 
     // Status calculation logic
     const now = new Date();
-    const updatedLockers = lockers.map(locker => {
+    const updatedLockers = await Promise.all(lockers.map(async (locker) => {
       let status = "unknown";
       if (locker.lastHeartbeat) {
         const diff = now - new Date(locker.lastHeartbeat);
@@ -2797,11 +3453,111 @@ app.get("/api/lockers", async (req, res) => {
           status = "offline";
         }
       }
+
+      // Fetch ALL customer information from active shipments in this locker (MULTI-USER SUPPORT)
+      let customerInfo = {
+        name: '-',
+        address: '-',
+        phone: '-'
+      };
+
+      // Count total deliveries (pending/active shipments)
+      let deliveriesCount = 0;
+
+      // Try to find ALL active shipments in this locker
+      const activeShipments = await Shipment.find({
+        lockerId: locker.lockerId,
+        status: { $in: ['assigned_to_locker', 'pending_locker', 'delivered_to_locker'] }
+      }).sort({ deliveredToLockerAt: -1 });
+
+      deliveriesCount = activeShipments.length;
+
+      if (activeShipments.length > 0) {
+        // Get unique customers (maintain consistent order by sorting)
+        const uniqueCustomerIds = [...new Set(activeShipments.map(s => s.customerId).filter(Boolean))].sort();
+        
+        if (uniqueCustomerIds.length === 1) {
+          // Single customer - show their info
+          const activeShipment = activeShipments[0];
+          const customer = await User.findOne({ userId: activeShipment.customerId });
+          if (customer) {
+            customerInfo = {
+              name: customer.name || activeShipment.receiverName || '-',
+              address: customer.address || '-',
+              phone: customer.phone || activeShipment.receiverPhone || '-'
+            };
+          } else {
+            customerInfo = {
+              name: activeShipment.receiverName || '-',
+              address: '-',
+              phone: activeShipment.receiverPhone || '-'
+            };
+          }
+        } else if (uniqueCustomerIds.length > 1) {
+          // Multiple customers - fetch all customer data first to maintain order
+          const customersData = [];
+          
+          for (const customerId of uniqueCustomerIds) {
+            const customer = await User.findOne({ userId: customerId });
+            if (customer) {
+              customersData.push({
+                name: customer.name || '-',
+                address: customer.address || '-',
+                phone: customer.phone || '-'
+              });
+            } else {
+              // Fallback to shipment receiver info
+              const shipment = activeShipments.find(s => s.customerId === customerId);
+              if (shipment) {
+                customersData.push({
+                  name: shipment.receiverName || '-',
+                  address: '-',
+                  phone: shipment.receiverPhone || '-'
+                });
+              }
+            }
+          }
+          
+          customerInfo = {
+            name: customersData.map(c => c.name).join(', ') || '-',
+            address: customersData.map(c => c.address).join(', ') || '-',
+            phone: customersData.map(c => c.phone).join(', ') || '-'
+          };
+        } else {
+          // No customerId but has shipments - use first shipment receiver info
+          const activeShipment = activeShipments[0];
+          customerInfo = {
+            name: activeShipment.receiverName || '-',
+            address: '-',
+            phone: activeShipment.receiverPhone || '-'
+          };
+        }
+      } else if (locker.customerId) {
+        // No active shipment, try locker owner
+        const customer = await User.findOne({ userId: locker.customerId });
+        if (customer) {
+          customerInfo = {
+            name: customer.name || locker.ownerName || '-',
+            address: customer.address || locker.ownerAddress || '-',
+            phone: customer.phone || locker.ownerPhone || '-'
+          };
+        }
+      } else {
+        // Fallback to registration owner info
+        customerInfo = {
+          name: locker.ownerName || '-',
+          address: locker.ownerAddress || '-',
+          phone: locker.ownerPhone || '-'
+        };
+      }
+
       return {
         ... locker. toObject(),
         status,
+        customerInfo,
+        deliveries: deliveriesCount // Add delivery count
       };
-    });
+    }));
 
     return res.json(updatedLockers);
   } catch (err) {
@@ -3687,6 +4443,506 @@ app.get('/api/metrics/summary', async (req, res) => {
     res.json(summary);
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================================================
+// WEIGHT MEASUREMENT ENDPOINTS (ESP32) - DIFFERENTIAL ALGORITHM
+// ==================================================
+
+// In-memory weight session storage (per locker)
+const weightSessions = new Map();
+
+// Start weight measurement session (called after courier scan)
+app.post("/api/locker/:lockerId/weight/start", async (req, res) => {
+  try {
+    const { lockerId } = req.params;
+    const { resi } = req.body;
+
+    console.log(`[WEIGHT SESSION] Starting for ${lockerId}, resi: ${resi}`);
+
+    if (!resi) {
+      return res.status(400).json({
+        ok: false,
+        error: "resi wajib diisi"
+      });
+    }
+
+    // Initialize weight session
+    const sessionId = `${lockerId}-${Date.now()}`;
+    weightSessions.set(lockerId, {
+      sessionId,
+      resi: resi.trim().toUpperCase(),
+      startedAt: new Date(),
+      readings: [], // Store all weight readings
+      active: true
+    });
+
+    console.log(`[WEIGHT SESSION] ✅ Started session ${sessionId} for resi ${resi}`);
+
+    return res.json({
+      ok: true,
+      message: "Weight session started",
+      sessionId,
+      lockerId,
+      resi: resi.trim().toUpperCase(),
+      duration: "20 seconds"
+    });
+
+  } catch (err) {
+    console.error("POST /api/locker/:lockerId/weight/start error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Gagal memulai weight session"
+    });
+  }
+});
+
+// ESP32 sends weight readings (called every few seconds)
+app.post("/api/locker/:lockerId/weight/reading", async (req, res) => {
+  try {
+    const { lockerId } = req.params;
+    const { weight } = req.body; // weight in kilograms
+
+    console.log(`[API IN] POST /api/locker/${lockerId}/weight/reading - Body:`, req.body);
+
+    // Validate weight
+    const weightValue = parseFloat(weight);
+    if (isNaN(weightValue) || weightValue < 0 || weightValue > 50) {
+      console.log(`[WEIGHT] ❌ Invalid weight: ${weight}`);
+      return res.status(400).json({
+        ok: false,
+        error: "Weight value tidak valid (harus 0-50 kg)"
+      });
+    }
+
+    // Check if session exists
+    const session = weightSessions.get(lockerId);
+    console.log(`[WEIGHT] Session check - lockerId: ${lockerId}, exists: ${!!session}, active: ${session?.active}`);
+    
+    if (!session || !session.active) {
+      console.log(`[WEIGHT] ❌ No active session for ${lockerId}. Available sessions:`, Array.from(weightSessions.keys()));
+      return res.status(404).json({
+        ok: false,
+        error: "No active weight session for this locker"
+      });
+    }
+
+    // Add reading to session
+    session.readings.push({
+      weight: weightValue,
+      timestamp: new Date()
+    });
+
+    console.log(`[WEIGHT READING] ${lockerId}: ${weightValue}kg (reading #${session.readings.length}) - RESI: ${session.resi}`);
+
+    return res.json({
+      ok: true,
+      message: "Weight reading recorded",
+      sessionId: session.sessionId,
+      readingNumber: session.readings.length,
+      weight: weightValue,
+      resi: session.resi
+    });
+
+  } catch (err) {
+    console.error("POST /api/locker/:lockerId/weight/reading error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Gagal merekam weight reading"
+    });
+  }
+});
+
+// Finalize weight measurement (calculate difference and assign to resi)
+app.post("/api/locker/:lockerId/weight/finalize", async (req, res) => {
+  try {
+    const { lockerId } = req.params;
+
+    console.log(`[WEIGHT FINALIZE] Processing for ${lockerId}`);
+
+    // Get session
+    const session = weightSessions.get(lockerId);
+    if (!session || !session.active) {
+      return res.status(404).json({
+        ok: false,
+        error: "No active weight session for this locker"
+      });
+    }
+
+    // Check if we have at least 2 readings
+    if (session.readings.length < 2) {
+      return res.status(400).json({
+        ok: false,
+        error: "Need at least 2 weight readings to calculate difference"
+      });
+    }
+
+    // Calculate weight difference (initial - final = package weight)
+    const initialWeight = session.readings[0].weight;
+    const finalWeight = session.readings[session.readings.length - 1].weight;
+    const packageWeight = parseFloat(Math.abs(initialWeight - finalWeight).toFixed(3));
+
+    console.log(`[WEIGHT CALC] Initial: ${initialWeight}kg, Final: ${finalWeight}kg, Difference: ${packageWeight}kg`);
+
+    // Find the shipment
+    const shipment = await Shipment.findOne({ resi: session.resi });
+
+    if (!shipment) {
+      console.error(`[WEIGHT] Shipment not found for resi: ${session.resi}`);
+      // Mark session as inactive
+      session.active = false;
+      return res.status(404).json({
+        ok: false,
+        error: "Shipment tidak ditemukan untuk resi ini"
+      });
+    }
+
+    // Check if weight already recorded
+    if (shipment.weight !== null && shipment.weight !== undefined) {
+      console.log(`[WEIGHT] Weight already recorded for ${session.resi}: ${shipment.weight}kg`);
+      session.active = false;
+      return res.json({
+        ok: true,
+        message: "Weight sudah tercatat sebelumnya",
+        data: {
+          resi: shipment.resi,
+          weight: shipment.weight,
+          weightRecordedAt: shipment.weightRecordedAt,
+          alreadyRecorded: true
+        }
+      });
+    }
+
+    // Assign weight to shipment
+    shipment.weight = packageWeight;
+    shipment.weightRecordedAt = new Date();
+
+    // Add log entry with all readings
+    shipment.logs.push({
+      event: "weight_recorded_differential",
+      lockerId,
+      resi: shipment.resi,
+      timestamp: new Date(),
+      extra: {
+        initialWeight,
+        finalWeight,
+        packageWeight,
+        readingsCount: session.readings.length,
+        unit: "kilograms"
+      }
+    });
+
+    await shipment.save();
+
+    console.log(`[WEIGHT] ✅ Assigned ${packageWeight}kg to resi ${session.resi}`);
+
+    // Send notification to customer
+    try {
+      if (shipment.customerId) {
+        await sendNotificationToCustomer(
+          shipment.customerId,
+          '📦 Paket Sudah di Locker',
+          `Paket ${session.resi} telah diterima (${packageWeight.toFixed(2)} kg)`,
+          {
+            type: 'weight_recorded',
+            resi: shipment.resi,
+            weight: packageWeight,
+            lockerId: lockerId
+          }
+        );
+      }
+    } catch (notifErr) {
+      console.error('[WEIGHT NOTIFICATION] Failed:', notifErr.message);
+    }
+
+    // Mark session as inactive
+    session.active = false;
+
+    return res.json({
+      ok: true,
+      message: "Weight berhasil direkam",
+      data: {
+        resi: shipment.resi,
+        weight: packageWeight,
+        unit: "kg",
+        weightRecordedAt: shipment.weightRecordedAt,
+        lockerId: lockerId,
+        calculation: {
+          initialWeight,
+          finalWeight,
+          difference: packageWeight,
+          readingsCount: session.readings.length
+        }
+      }
+    });
+
+  } catch (err) {
+    console.error("POST /api/locker/:lockerId/weight/finalize error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Gagal finalize weight measurement"
+    });
+  }
+});
+
+// Get current weight session status (for monitoring)
+app.get("/api/locker/:lockerId/weight/status", async (req, res) => {
+  try {
+    const { lockerId } = req.params;
+    const session = weightSessions.get(lockerId);
+
+    if (!session) {
+      return res.json({
+        ok: true,
+        hasSession: false,
+        message: "No weight session for this locker"
+      });
+    }
+
+    return res.json({
+      ok: true,
+      hasSession: true,
+      session: {
+        sessionId: session.sessionId,
+        resi: session.resi,
+        startedAt: session.startedAt,
+        active: session.active,
+        readingsCount: session.readings.length,
+        latestWeight: session.readings.length > 0 
+          ? session.readings[session.readings.length - 1].weight 
+          : null
+      }
+    });
+
+  } catch (err) {
+    console.error("GET /api/locker/:lockerId/weight/status error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Gagal mengambil status weight session"
+    });
+  }
+});
+
+// Get weight data for a specific resi
+app.get("/api/shipments/:resi/weight", async (req, res) => {
+  try {
+    const { resi } = req.params;
+    const cleanResi = resi.trim().toUpperCase();
+
+    const shipment = await Shipment.findOne({ resi: cleanResi }).lean();
+
+    if (!shipment) {
+      return res.status(404).json({
+        ok: false,
+        error: "Shipment tidak ditemukan"
+      });
+    }
+
+    return res.json({
+      ok: true,
+      data: {
+        resi: shipment.resi,
+        weight: shipment.weight,
+        unit: "kg",
+        weightRecordedAt: shipment.weightRecordedAt,
+        hasWeight: shipment.weight !== null && shipment.weight !== undefined,
+        status: shipment.status
+      }
+    });
+
+  } catch (err) {
+    console.error("GET /api/shipments/:resi/weight error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Gagal mengambil data weight"
+    });
+  }
+});
+
+// ==================================================
+// TESTING ENDPOINT - Simulate entire weight measurement flow
+// ==================================================
+app.post("/api/test/weight-simulation", async (req, res) => {
+  try {
+    const { lockerId, resi } = req.body;
+
+    if (!lockerId || !resi) {
+      return res.status(400).json({
+        ok: false,
+        error: "lockerId and resi required"
+      });
+    }
+
+    console.log(`\n========================================`);
+    console.log(`[TEST] Starting weight simulation for ${lockerId}, resi: ${resi}`);
+    console.log(`========================================\n`);
+
+    const results = {
+      step1_start: null,
+      step2_readings: [],
+      step3_finalize: null,
+      step4_verify: null
+    };
+
+    // STEP 1: Start weight session
+    try {
+      const startRes = await axios.post(`http://localhost:${PORT}/api/locker/${lockerId}/weight/start`, {
+        resi: resi
+      });
+      results.step1_start = startRes.data;
+      console.log(`[TEST] ✅ Step 1 - Session started:`, startRes.data);
+    } catch (err) {
+      return res.status(500).json({
+        ok: false,
+        error: "Failed to start session",
+        detail: err.response?.data || err.message
+      });
+    }
+
+    // STEP 2: Simulate weight readings (5 readings over 20 seconds)
+    // Simulating: 5kg → 4.8kg → 4.6kg → 4.5kg → 4.3kg (package removed = ~0.7kg)
+    const simulatedWeights = [5.0, 4.8, 4.6, 4.5, 4.3];
+    
+    for (let i = 0; i < simulatedWeights.length; i++) {
+      try {
+        await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second between readings
+        
+        const readingRes = await axios.post(`http://localhost:${PORT}/api/locker/${lockerId}/weight/reading`, {
+          weight: simulatedWeights[i]
+        });
+        
+        results.step2_readings.push(readingRes.data);
+        console.log(`[TEST] ✅ Step 2.${i+1} - Reading recorded: ${simulatedWeights[i]}kg`);
+      } catch (err) {
+        console.error(`[TEST] ❌ Failed to send reading ${i+1}:`, err.message);
+      }
+    }
+
+    // STEP 3: Finalize measurement
+    try {
+      await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second
+      
+      const finalizeRes = await axios.post(`http://localhost:${PORT}/api/locker/${lockerId}/weight/finalize`);
+      results.step3_finalize = finalizeRes.data;
+      console.log(`[TEST] ✅ Step 3 - Finalized:`, finalizeRes.data);
+    } catch (err) {
+      return res.status(500).json({
+        ok: false,
+        error: "Failed to finalize",
+        detail: err.response?.data || err.message,
+        partialResults: results
+      });
+    }
+
+    // STEP 4: Verify weight was saved
+    try {
+      const verifyRes = await axios.get(`http://localhost:${PORT}/api/shipments/${resi}/weight`);
+      results.step4_verify = verifyRes.data;
+      console.log(`[TEST] ✅ Step 4 - Verified:`, verifyRes.data);
+    } catch (err) {
+      console.error(`[TEST] ⚠️ Failed to verify:`, err.message);
+    }
+
+    console.log(`\n========================================`);
+    console.log(`[TEST] ✅ SIMULATION COMPLETE`);
+    console.log(`========================================\n`);
+
+    return res.json({
+      ok: true,
+      message: "Weight simulation completed successfully",
+      summary: {
+        lockerId,
+        resi,
+        initialWeight: simulatedWeights[0],
+        finalWeight: simulatedWeights[simulatedWeights.length - 1],
+        calculatedDifference: simulatedWeights[0] - simulatedWeights[simulatedWeights.length - 1],
+        recordedWeight: results.step3_finalize?.data?.weight || null
+      },
+      detailedResults: results
+    });
+
+  } catch (err) {
+    console.error("[TEST] Weight simulation error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Simulation failed",
+      detail: err.message
+    });
+  }
+});
+
+// ==================================================
+// TESTING ENDPOINT - Manually set weight for shipment (for testing UI)
+// ==================================================
+app.post("/api/test/set-weight", async (req, res) => {
+  try {
+    const { resi, weight } = req.body;
+
+    if (!resi || !weight) {
+      return res.status(400).json({
+        ok: false,
+        error: "resi and weight required"
+      });
+    }
+
+    const cleanResi = resi.trim().toUpperCase();
+    const weightKg = parseFloat(weight);
+
+    if (isNaN(weightKg) || weightKg <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid weight value"
+      });
+    }
+
+    const shipment = await Shipment.findOne({ resi: cleanResi });
+
+    if (!shipment) {
+      return res.status(404).json({
+        ok: false,
+        error: "Shipment not found"
+      });
+    }
+
+    shipment.weight = parseFloat(weightKg.toFixed(3));
+    shipment.weightRecordedAt = new Date();
+
+    // Add log entry
+    shipment.logs.push({
+      event: "weight_recorded",
+      lockerId: shipment.lockerId,
+      resi: shipment.resi,
+      timestamp: new Date(),
+      extra: {
+        weight: weightKg,
+        source: "manual_test"
+      }
+    });
+
+    await shipment.save();
+
+    console.log(`[TEST] ✅ Manually set weight ${weightKg}kg for resi ${cleanResi}`);
+
+    return res.json({
+      ok: true,
+      message: "Weight successfully set",
+      data: {
+        resi: shipment.resi,
+        weight: shipment.weight,
+        weightKg: shipment.weight.toFixed(2),
+        unit: "kg",
+        weightRecordedAt: shipment.weightRecordedAt
+      }
+    });
+
+  } catch (err) {
+    console.error("[TEST] Set weight error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Failed to set weight",
+      detail: err.message
+    });
   }
 });
 

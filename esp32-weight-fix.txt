@@ -1,0 +1,72 @@
+ESP32 CODE FIX - startWeightSession() Function
+===============================================
+
+REPLACE THIS:
+-------------
+void startWeightSession() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String url = URL("/api/locker/" + String(LOCKER_ID) + "/weight/start");
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+
+  int code = http.POST("");  // ❌ PROBLEM: Empty body!
+  
+  if (code == 200 || code == 201) {
+    Serial.println("[WEIGHT] ✅ Session started");
+  } else {
+    String response = http.getString();
+    Serial.println("[WEIGHT] Session start failed (" + String(code) + "): " + response);
+  }
+  
+  http.end();
+}
+
+WITH THIS:
+----------
+void startWeightSession() {
+  if (WiFi.status() != WL_CONNECTED || currentResi == "") {
+    Serial.println("[WEIGHT] ⚠️ Cannot start session - WiFi or resi missing");
+    return;
+  }
+
+  HTTPClient http;
+  String url = URL("/api/locker/" + String(LOCKER_ID) + "/weight/start");
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+
+  // ✅ FIX: Send resi in body
+  StaticJsonDocument<128> doc;
+  doc["resi"] = currentResi;
+  
+  String body;
+  serializeJson(doc, body);
+  
+  Serial.println("[WEIGHT] Starting session for resi: " + currentResi);
+  int code = http.POST(body);  // ✅ Send body with resi
+  
+  if (code == 200 || code == 201) {
+    Serial.println("[WEIGHT] ✅ Session started successfully");
+  } else {
+    String response = http.getString();
+    Serial.println("[WEIGHT] Session start failed (" + String(code) + "): " + response);
+  }
+  
+  http.end();
+}
+
+ADDITIONAL NOTES:
+-----------------
+1. TESTING_MODE is true - ESP32 will always send 10kg
+   - This is FINE for testing
+   - Set to false when you want real sensor readings
+
+2. Your backend is at 192.168.0.56:3000 ✅
+   - Make sure ESP32 WiFi "HySpace" can reach this IP
+
+3. Test flow:
+   - Backend sends "open" command with resi
+   - ESP32 opens locker + starts weight session WITH resi
+   - ESP32 sends weight readings every 2 seconds
+   - After 5 seconds, closes and sends deposit with weight
